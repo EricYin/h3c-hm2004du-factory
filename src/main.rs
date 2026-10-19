@@ -369,12 +369,18 @@ fn blob_section(
 ///    light style explicitly also makes this independent of call order.
 fn light_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::light();
-    // `weak` text is used for statuses, hints and the source labels; the stock
-    // light value is a low-contrast grey, so darken it to keep it legible.
-    v.weak_text_color = egui::Color32::from_gray(110);
-    v.widgets.inactive.bg_fill = egui::Color32::from_gray(225);
+    // `weak_text_color` is an `Option<Color32>`: `None` means "derive from
+    // text_color * weak_text_alpha (0.6)", which is what makes the stock light
+    // palette so washed out. Pin it to a readable grey instead.
+    v.weak_text_color = Some(egui::Color32::from_gray(110));
+    // Stock light uses 230 / 220 / 165 for the three button states — too close
+    // together to read as distinct at a glance. Spread them out.
+    v.widgets.inactive.bg_fill = egui::Color32::from_gray(238);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(238);
     v.widgets.hovered.bg_fill = egui::Color32::from_gray(205);
-    v.widgets.active.bg_fill = egui::Color32::from_gray(190);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(205);
+    v.widgets.active.bg_fill = egui::Color32::from_gray(170);
+    v.widgets.active.weak_bg_fill = egui::Color32::from_gray(170);
     v.panel_fill = egui::Color32::WHITE;
     v.window_fill = egui::Color32::WHITE;
     v.window_stroke.color = egui::Color32::from_gray(150);
