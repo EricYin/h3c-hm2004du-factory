@@ -129,7 +129,13 @@ h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
 
 状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。
 
-界面固定为**亮色主题**，且每帧重申一次（`apply_light_theme`）。原因：egui 的 `Options`（含 `theme_preference`）会经 eframe persistence 落盘并在启动时恢复，而 `theme_preference` 默认是 `System` —— 系统为深色时 `Options::theme()` 返回 `Dark`，`Ui` 按 dark style 取色，表现为「背景浅、文字深」的半成品外观。仅在启动回调里设置一次挡不住持久化恢复与系统主题变更事件，故在每帧开头幂等重申。
+界面固定为**亮色主题**（白色）。这个"白色"由三处配合完成，缺一不可 —— 前三处都是对 eframe/egui 0.36.2 源码逐行核实后的结论：
+
+1. **重写 `App::clear_color` 返回纯白** —— 这是关键。eframe 的默认清屏色是**硬编码的深色** `(12,12,12)`@alpha180，完全无视主题（`eframe/src/epi.rs` 里写着 "a bright gray makes the shadows of the windows look weird"）；而 egui 0.36 传给 `App::ui` 的根 `Ui` **自己不画背景**（官方注释："has no margin or background color"），于是这个深色透出来占满整个窗口。只改 `Visuals` 是治标不治本：控件会变白，窗口依旧发黑。
+2. **`apply_light_theme` 把 dark / light 两个 style 都写成亮色** —— `theme_preference` 默认是 `System`，系统为深色时 `Options::theme()` 解析成 `Dark`，Ui 会一直按 dark style 取色；两个 style 都写亮，解析结果就无所谓了。顺带 `set_theme(Light)` 固定偏好。stock 亮色盘的两处也顺手调了：`weak_text_color`（默认由 `text_color * 0.6` 派生，白底上发灰）钉成 110，三态按钮底色 230/220/165 拉开成 238/205/170。
+3. **`ui.set_style(...)` 钉住当前帧** —— 根 `Ui` 的 style 在帧开始时就被快照成 `Arc<Style>`，只改 ctx 要等下一帧才生效，首帧会闪一下深色；在 `App::ui` 开头把根 Ui 的 style 也换掉，首帧起就是白的。
+
+已知限制：eframe 0.36.2 不转发 `ViewportCommand::SetTheme` 给原生窗口，所以**窗口标题栏仍跟随系统主题**（仅装饰，应用内容全部为白色）。
 
 ## Python 伴生工具（无需 Rust）
 

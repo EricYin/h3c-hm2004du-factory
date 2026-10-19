@@ -111,16 +111,28 @@ impl Editor {
 }
 
 impl eframe::App for Editor {
+    /// 窗口清屏色。
+    ///
+    /// **这是「界面改为白色」一直没生效的真正原因**：eframe 的默认实现返回一个
+    /// 硬编码的深色 `(12,12,12)`@alpha180，完全无视主题（源码里写着 "a bright
+    /// gray makes the shadows of the windows look weird"）；而 egui 0.36 传给
+    /// `App::ui` 的根 `Ui` 自己不画背景（官方注释："has no margin or background
+    /// color"），于是这个深色透过整个窗口 —— 表现就是控件都变浅了、窗口还是黑的。
+    /// 钉成纯白即可，且不依赖 `visuals` 参数（它在每帧 `ctx.run()` 之前取样，
+    /// 首帧可能还是深色 style）。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Color32::WHITE.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 每帧重申亮色主题。
+        // 每帧重申亮色主题。两件事都要做，缺一不可：
         //
-        // 只在创建回调里设置一次并不可靠：egui 的 `Options`（含
-        // `theme_preference`）会经 eframe 的 persistence 在启动时从磁盘恢复，
-        // 而 `theme_preference` 默认是 `System` —— 系统若为深色，`theme()` 就
-        // 返回 `Dark`，`Ui` 于是按 dark style 取颜色，表现为「背景被换成浅色、
-        // 文字仍是深色」的半成品外观。在每帧开头重设，成本可忽略，且能盖住
-        // 任何来自持久化或系统事件的覆盖。
-        apply_light_theme(ui.ctx());
+        // 1. `apply_light_theme` 改 ctx：`theme_preference` 默认是 `System`，
+        //    系统深色时 `Options::theme()` 解析成 `Dark`，Ui 会按 dark style
+        //    取色。把 dark / light 两个 style 都写成亮色，解析结果就无所谓了。
+        // 2. `ui.set_style` 改当前帧：根 `Ui` 的 style 在帧开始就被快照成
+        //    `Arc<Style>`，只改 ctx 对本帧无效（要等下一帧）。钉一下，首帧就不闪。
+        ui.set_style(apply_light_theme(ui.ctx()));
 
         // ---- 顶栏：标题 + 动作 ----
         ui.horizontal(|ui| {
@@ -365,47 +377,46 @@ fn blob_section(
     ui.add_space(4.0);
 }
 
-/// The application's colour scheme.
-/// Force the light theme onto `ctx`, idempotently.
+/// 构造本应用的亮色 [`egui::Style`]（只构造一次，之后每次只是 Arc 克隆）。
 ///
-/// Two things are needed, and both matter:
+/// 在 `egui::Visuals::light()` 基础上改三处：
+/// - `weak_text_color`：默认由 `text_color * weak_text_alpha(0.6)` 派生，白底上
+///   发灰、几乎不可读，钉成 110。
+/// - 三态按钮底色 230 / 220 / 165 太接近，一眼分不出，拉开成 238 / 205 / 170。
+/// - `panel_fill` / `window_fill` 钉成纯白。
+fn light_style() -> std::sync::Arc<egui::Style> {
+    static STYLE: std::sync::OnceLock<std::sync::Arc<egui::Style>> = std::sync::OnceLock::new();
+    STYLE
+        .get_or_init(|| {
+            let mut v = egui::Visuals::light();
+            v.weak_text_color = Some(egui::Color32::from_gray(110));
+            v.widgets.inactive.bg_fill = egui::Color32::from_gray(238);
+            v.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(238);
+            v.widgets.hovered.bg_fill = egui::Color32::from_gray(205);
+            v.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(205);
+            v.widgets.active.bg_fill = egui::Color32::from_gray(170);
+            v.widgets.active.weak_bg_fill = egui::Color32::from_gray(170);
+            v.panel_fill = egui::Color32::WHITE;
+            v.window_fill = egui::Color32::WHITE;
+            v.window_stroke.color = egui::Color32::from_gray(150);
+            let mut style = egui::Style::default();
+            style.visuals = v;
+            std::sync::Arc::new(style)
+        })
+        .clone()
+}
+
+/// 把亮色主题强制写到 `ctx` 上，返回该 style 供调用方钉到当前帧的根 `Ui`。
 ///
-/// 1. `ctx.set_theme(Theme::Light)` — this flips `theme_preference` away from
-///    its `System` default, so `Options::theme()` stops deferring to the OS
-///    preference. Toggling `Visuals::dark_mode` alone does almost nothing
-///    (egui documents that field as "a convenient summary of the rest").
-/// 2. `ctx.set_visuals_of(Theme::Light, ..)` — the stock light palette leaves
-///    `weak` text (statuses, hints, source labels) derived from
-///    `text_color * weak_text_alpha(0.6)`, which reads as washed-out grey on
-///    white; pin it to a readable grey instead. Writing into the light style
-///    explicitly also makes this independent of call order.
-///
-/// Cheap and idempotent, so it runs at the top of every frame: egui persists
-/// `Options` (including `theme_preference`) to disk via eframe, and a system
-/// theme-change event can reset it at any time. Re-asserting here makes the
-/// app immune to both. The guard keeps the common case free of work.
-fn apply_light_theme(ctx: &egui::Context) {
-    if ctx.theme() == egui::Theme::Light
-        && ctx.global_style().visuals.weak_text_color.is_some()
-    {
-        // Already ours.
-        return;
-    }
-    let mut v = egui::Visuals::light();
-    v.weak_text_color = Some(egui::Color32::from_gray(110));
-    // Stock light uses 230 / 220 / 165 for the three button states — too close
-    // together to read as distinct at a glance. Spread them out.
-    v.widgets.inactive.bg_fill = egui::Color32::from_gray(238);
-    v.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(238);
-    v.widgets.hovered.bg_fill = egui::Color32::from_gray(205);
-    v.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(205);
-    v.widgets.active.bg_fill = egui::Color32::from_gray(170);
-    v.widgets.active.weak_bg_fill = egui::Color32::from_gray(170);
-    v.panel_fill = egui::Color32::WHITE;
-    v.window_fill = egui::Color32::WHITE;
-    v.window_stroke.color = egui::Color32::from_gray(150);
-    ctx.set_visuals_of(egui::Theme::Light, v);
+/// `Options::theme()` 在 `ThemePreference::System`（默认值）时按系统偏好解析，
+/// 系统是深色就会一直选到 `dark_style`；所以这里把 dark / light 两个 style 都
+/// 写成亮色，无论解析成什么都不影响，再用 `set_theme` 把偏好固定成 Light。
+fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
+    let style = light_style();
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style.clone());
     ctx.set_theme(egui::Theme::Light);
+    style
 }
 
 fn main() -> eframe::Result {
