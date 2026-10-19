@@ -108,6 +108,14 @@ impl eframe::App for Editor {
         ui.label(&self.msg);
         ui.separator();
 
+        // 折叠式摘要：打开文件后一眼看清各项是否真的载入（含下行 PON 校准）
+        egui::CollapsingHeader::new("当前镜像摘要")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.monospace(self.factory.summary());
+            });
+        ui.separator();
+
         // ---- 身份信息 ----
         ui.heading("身份信息");
         const FIELD: f32 = 280.0;

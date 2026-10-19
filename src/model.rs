@@ -67,6 +67,11 @@ pub const FACTORY_VOLUME_SIZE: usize = 0x240000; // 2_359_296
 // plus 6 bytes of BOSA flags right after it.
 pub const DEMO_SIZE: usize = 0x1c3000; // 1_847_296
 
+/// Our layout-mapped export must never claim to be larger than the real
+/// volume, otherwise a stray field offset would silently produce an image no
+/// flasher could accept. Checked at compile time.
+const _: () = assert!(DEMO_SIZE < FACTORY_VOLUME_SIZE);
+
 pub const MAGIC_OFFSET: usize = 0x140000;
 pub const MAGIC: [u8; 4] = [0x21, 0x43, 0x34, 0x12];
 
