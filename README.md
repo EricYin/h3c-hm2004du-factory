@@ -127,7 +127,9 @@ h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
 ./h3c-hm2004du-factory mtd14_reservearea.bin mtd13_h3c.bin
 ```
 
-状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。界面为**亮色主题**（egui 默认跟随系统，此处显式固定为 Light）。
+状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。
+
+界面固定为**亮色主题**，且每帧重申一次（`apply_light_theme`）。原因：egui 的 `Options`（含 `theme_preference`）会经 eframe persistence 落盘并在启动时恢复，而 `theme_preference` 默认是 `System` —— 系统为深色时 `Options::theme()` 返回 `Dark`，`Ui` 按 dark style 取色，表现为「背景浅、文字深」的半成品外观。仅在启动回调里设置一次挡不住持久化恢复与系统主题变更事件，故在每帧开头幂等重申。
 
 ## Python 伴生工具（无需 Rust）
 

@@ -112,6 +112,16 @@ impl Editor {
 
 impl eframe::App for Editor {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 每帧重申亮色主题。
+        //
+        // 只在创建回调里设置一次并不可靠：egui 的 `Options`（含
+        // `theme_preference`）会经 eframe 的 persistence 在启动时从磁盘恢复，
+        // 而 `theme_preference` 默认是 `System` —— 系统若为深色，`theme()` 就
+        // 返回 `Dark`，`Ui` 于是按 dark style 取颜色，表现为「背景被换成浅色、
+        // 文字仍是深色」的半成品外观。在每帧开头重设，成本可忽略，且能盖住
+        // 任何来自持久化或系统事件的覆盖。
+        apply_light_theme(ui.ctx());
+
         // ---- 顶栏：标题 + 动作 ----
         ui.horizontal(|ui| {
             ui.heading("H3C Factory");
@@ -356,22 +366,32 @@ fn blob_section(
 }
 
 /// The application's colour scheme.
+/// Force the light theme onto `ctx`, idempotently.
 ///
 /// Two things are needed, and both matter:
 ///
-/// 1. `ctx.set_theme(Theme::Light)` — this flips the *style* selection, so all
-///    widgets, panels and popups are laid out and coloured for a light
-///    background. Toggling `Visuals::dark_mode` alone does almost nothing
+/// 1. `ctx.set_theme(Theme::Light)` — this flips `theme_preference` away from
+///    its `System` default, so `Options::theme()` stops deferring to the OS
+///    preference. Toggling `Visuals::dark_mode` alone does almost nothing
 ///    (egui documents that field as "a convenient summary of the rest").
-/// 2. `ctx.set_visuals_of(Theme::Light, light_visuals())` — the stock light
-///    palette leaves `weak` text (statuses, hints, source labels) a very
-///    low-contrast grey that is hard to read, so darken it. Writing it to the
-///    light style explicitly also makes this independent of call order.
-fn light_visuals() -> egui::Visuals {
+/// 2. `ctx.set_visuals_of(Theme::Light, ..)` — the stock light palette leaves
+///    `weak` text (statuses, hints, source labels) derived from
+///    `text_color * weak_text_alpha(0.6)`, which reads as washed-out grey on
+///    white; pin it to a readable grey instead. Writing into the light style
+///    explicitly also makes this independent of call order.
+///
+/// Cheap and idempotent, so it runs at the top of every frame: egui persists
+/// `Options` (including `theme_preference`) to disk via eframe, and a system
+/// theme-change event can reset it at any time. Re-asserting here makes the
+/// app immune to both. The guard keeps the common case free of work.
+fn apply_light_theme(ctx: &egui::Context) {
+    if ctx.theme() == egui::Theme::Light
+        && ctx.global_style().visuals.weak_text_color.is_some()
+    {
+        // Already ours.
+        return;
+    }
     let mut v = egui::Visuals::light();
-    // `weak_text_color` is an `Option<Color32>`: `None` means "derive from
-    // text_color * weak_text_alpha (0.6)", which is what makes the stock light
-    // palette so washed out. Pin it to a readable grey instead.
     v.weak_text_color = Some(egui::Color32::from_gray(110));
     // Stock light uses 230 / 220 / 165 for the three button states — too close
     // together to read as distinct at a glance. Spread them out.
@@ -384,7 +404,8 @@ fn light_visuals() -> egui::Visuals {
     v.panel_fill = egui::Color32::WHITE;
     v.window_fill = egui::Color32::WHITE;
     v.window_stroke.color = egui::Color32::from_gray(150);
-    v
+    ctx.set_visuals_of(egui::Theme::Light, v);
+    ctx.set_theme(egui::Theme::Light);
 }
 
 fn main() -> eframe::Result {
@@ -399,15 +420,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
-            // 固定亮色，顺序与 API 都要讲究：
-            //   * `set_theme(Light)` 让 theme_preference 变成 Light，
-            //     `Options::theme()` 不再回落到系统的 system_theme；
-            //   * `set_visuals_of(Light, ..)` 直接写 light style，不依赖
-            //     `theme()` 当前返回什么，因此与调用顺序无关。
-            // 只调 `set_visuals(Visuals::light())` 在系统为深色时会写进
-            // dark style，而 UI 读的是 dark style —— 就是「半深半浅」的成因。
-            cc.egui_ctx.set_visuals_of(egui::Theme::Light, light_visuals());
-            cc.egui_ctx.set_theme(egui::Theme::Light);
+            apply_light_theme(&cc.egui_ctx);
             let mut ed = Editor {
                 factory: Factory::new(),
                 device_sn: String::new(),
