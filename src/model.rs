@@ -14,6 +14,38 @@
 //! 0x80000   gzip of ctromfile.cfg — the real label MAC is AL-MAC="..." inside it
 //! ```
 //!
+//! ## 下行 PON 口校准（来自 mtd13）
+//!
+//! 下行 PON 口的光模块校准不在 factory 分区里，而是在 **mtd13** 分区中。
+//! mtd13 是一个 4 MiB 的 UBI 镜像（PEB = 0x20000，共 32 个 PEB），其中
+//! `ubi-volume-factory` 之外还挂了一个名为 `ubifs1` 的 UBIFS 动态卷。逆向
+//! 该卷后可以定位到一棵很小的目录树，它就是下行 PON 口 BOSA 的配置与校准表：
+//!
+//! ```text
+//! /bosa/OBosaMode              u16   BOSA 工作模式
+//! /bosa/BosaFlag               u16   BOSA 生效标志
+//! /bosa/TempFlag               u16   温度补偿标志
+//! /bosa/mmodified_UX3326.bin   0x120 UX3326 光模块校准表（核心数据）
+//! ```
+//!
+//! `mmodified_UX3326.bin` 的载荷是 **288 (0x120) 字节**，结构为：
+//!
+//! ```text
+//! 0x00  u32  版本/标记（实测小端 0xC86F0E02）
+//! 0x04  u16  模式 A（实测 0x0014 / 0x0014）
+//! 0x06  u16  模式 B（实测 0x0030 或 0x3903，随校准批次变化）
+//! 0x08..0x6f  厂商标定参数（阈值、增益、偏置、温漂，定点/浮点混合）
+//! 0x6f  u16[84]  接收灵敏度 LUT，单调递增（实测 0x013C .. 0x01C6）
+//! 0x117 u8[7]   尾部保留 (0)
+//! ```
+//!
+//! 该 blob 在 mtd13 内以 **多副本 + sqnum 递增** 的方式重复存放（UBIFS 日志
+//! 行为，实测 10 份），最新的副本 sqnum 最大。因此解析时取 sqnum 最大的
+//! 那一份，而不是物理上最靠后的那份。
+//!
+//! 本工具把整块 288 字节当作不透明 blob 保存/还原（`pon_downlink_calibration`），
+//! 与上行 PON 校准的处理方式保持一致；同时导出三个 u16 标量供 UI 展示。
+//!
 //! The label MAC is NOT stored in an addressable field: stock firmware keeps
 //! the reservearea slot blank and recovers it from `AL-MAC` inside the gzipped
 //! ctromfile at 0x80000 (see `02_network::h3c_hm2004du_base_mac`). This tool
@@ -31,7 +63,9 @@
 // Real ubi-volume-factory size.
 pub const FACTORY_VOLUME_SIZE: usize = 0x240000; // 2_359_296
 // Layout-mapped demo export size: highest used field rounded up to 4 KiB.
-pub const DEMO_SIZE: usize = 0x1c1000; // 1_839_104 (校准区 0x1c0400+0x200 向上取整到 4 KiB)
+// The downlink PON calibration sits at 0x1c1000 and runs for 0x120 bytes,
+// plus 6 bytes of BOSA flags right after it.
+pub const DEMO_SIZE: usize = 0x1c3000; // 1_847_296
 
 pub const MAGIC_OFFSET: usize = 0x140000;
 pub const MAGIC: [u8; 4] = [0x21, 0x43, 0x34, 0x12];
@@ -52,6 +86,21 @@ pub const CALIBRATION_SIZE: usize = 0x200;
 pub const WIFI_EEPROM_OFFSET: usize = 0x4c000;
 pub const WIFI_EEPROM_SIZE: usize = 0x1000;
 
+// ---- 下行 PON 口校准（mtd13 / UBIFS `ubifs1` 卷）----
+//
+// mtd13 是一个独立的 4 MiB UBI 镜像，不属于 ubi-volume-factory，所以真实
+// 分区里没有固定偏移。为了让演示/紧凑镜像也能携带这块数据，这里沿用
+// 「布局映射演示」的思路：把它放在紧跟 factory 校准区之后的固定偏移，
+// 并在 1 MiB 紧凑布局里分配一个文档化偏移。
+//
+// 原始数据在 mtd13 内部的定位由 `import::parse_mtd13` 完成（UBIFS 节点遍历
+// + sqnum 取最新），这里的常量只描述我们自己的导出格式。
+
+/// 演示镜像中下行 PON 校准的偏移（紧接上行 PON 校准区之后）。
+pub const PON_DOWNLINK_CAL_OFFSET: usize = 0x1c1000;
+/// UX3326 校准表长度（`mmodified_UX3326.bin` 的载荷）。
+pub const PON_DOWNLINK_CAL_SIZE: usize = 0x120;
+
 // ---- 1 MiB compact layout (self-describing, NOT flashable) ----
 //
 // The real H3C identity fields sit at 0x140000+, i.e. beyond 1 MiB, so a
@@ -68,7 +117,9 @@ pub const C_WIFI5G_MAC_OFFSET: usize = 0x0040; // label+4
 pub const C_WIFI24_MAC_OFFSET: usize = 0x0050; // label+5
 pub const C_DEVICE_SN_OFFSET: usize = 0x0060; // 12-byte ASCII
 pub const C_WIFI_EEPROM_OFFSET: usize = 0x1000; // 0x1000, MT7916
-pub const C_CALIBRATION_OFFSET: usize = 0x2000; // 0x200, EN7572
+pub const C_CALIBRATION_OFFSET: usize = 0x2000; // 0x200, EN7572 上行 PON
+pub const C_PON_DOWNLINK_CAL_OFFSET: usize = 0x2200; // 0x120, UX3326 下行 PON
+pub const C_PON_DOWNLINK_FLAGS_OFFSET: usize = 0x2400; // OBosaMode/BosaFlag/TempFlag
 
 // MAC derivation offsets (applied to the last byte only).
 pub const OFF_ETH0: u8 = 1;
@@ -76,12 +127,52 @@ pub const OFF_PON0: u8 = 2;
 pub const OFF_WIFI_5G: u8 = 4;
 pub const OFF_WIFI_24G: u8 = 5;
 
+/// The three BOSA scalars that live next to the UX3326 table in mtd13's
+/// `ubifs1` volume: `/bosa/OBosaMode`, `/bosa/BosaFlag`, `/bosa/TempFlag`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PonDownlinkFlags {
+    pub obosa_mode: u16,
+    pub bosa_flag: u16,
+    pub temp_flag: u16,
+}
+
+impl PonDownlinkFlags {
+    /// Six little-endian bytes, in the order the flags are stored.
+    pub fn to_bytes(self) -> [u8; PON_DOWNLINK_FLAGS_SIZE] {
+        let mut b = [0u8; PON_DOWNLINK_FLAGS_SIZE];
+        b[0..2].copy_from_slice(&self.obosa_mode.to_le_bytes());
+        b[2..4].copy_from_slice(&self.bosa_flag.to_le_bytes());
+        b[4..6].copy_from_slice(&self.temp_flag.to_le_bytes());
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Self {
+        let g = |i: usize| {
+            b.get(i..i + 2)
+                .map(|s| u16::from_le_bytes([s[0], s[1]]))
+                .unwrap_or(0)
+        };
+        PonDownlinkFlags {
+            obosa_mode: g(0),
+            bosa_flag: g(2),
+            temp_flag: g(4),
+        }
+    }
+}
+
+/// Size of the serialised [`PonDownlinkFlags`] blob (3 x u16 LE).
+pub const PON_DOWNLINK_FLAGS_SIZE: usize = 6;
+
 #[derive(Clone)]
 pub struct Factory {
     pub device_sn: String,
     pub label_mac: [u8; 6],
-    pub calibration: Vec<u8>, // 0x200
+    pub calibration: Vec<u8>, // 0x200, 上行 PON (EN7572)
     pub wifi_eeprom: Vec<u8>, // 0x1000
+    /// 下行 PON 口校准表 (`mmodified_UX3326.bin`), 0x120 bytes.
+    pub pon_downlink_cal: Vec<u8>,
+    /// `/bosa/` 下的三个 u16 标量。
+    pub pon_downlink_flags: PonDownlinkFlags,
 }
 
 impl Factory {
@@ -91,6 +182,8 @@ impl Factory {
             label_mac: random_mac(),
             calibration: vec![0xff; CALIBRATION_SIZE],
             wifi_eeprom: vec![0xff; WIFI_EEPROM_SIZE],
+            pon_downlink_cal: vec![0xff; PON_DOWNLINK_CAL_SIZE],
+            pon_downlink_flags: PonDownlinkFlags::default(),
         }
     }
 
@@ -136,8 +229,27 @@ impl Factory {
         if en > 0 {
             img[WIFI_EEPROM_OFFSET..WIFI_EEPROM_OFFSET + en].copy_from_slice(&self.wifi_eeprom[..en]);
         }
+        self.write_downlink(
+            &mut img,
+            PON_DOWNLINK_CAL_OFFSET,
+            PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE,
+        );
 
         img
+    }
+
+    /// Write the downlink PON blob + BOSA flags at `base`. Shared by the
+    /// layout-mapped demo image and the 1 MiB compact image so both stay in
+    /// sync.
+    fn write_downlink(&self, img: &mut [u8], base: usize, flags_off: usize) {
+        let dn = self.pon_downlink_cal.len().min(PON_DOWNLINK_CAL_SIZE);
+        if dn > 0 && base + dn <= img.len() {
+            img[base..base + dn].copy_from_slice(&self.pon_downlink_cal[..dn]);
+        }
+        let fb = self.pon_downlink_flags.to_bytes();
+        if flags_off + fb.len() <= img.len() {
+            img[flags_off..flags_off + fb.len()].copy_from_slice(&fb);
+        }
     }
 
     /// 1 MiB compact image: every field packed at fixed documented offsets so
@@ -175,14 +287,20 @@ impl Factory {
             img[C_CALIBRATION_OFFSET..C_CALIBRATION_OFFSET + cn]
                 .copy_from_slice(&self.calibration[..cn]);
         }
+        self.write_downlink(
+            &mut img,
+            C_PON_DOWNLINK_CAL_OFFSET,
+            C_PON_DOWNLINK_FLAGS_OFFSET,
+        );
 
         img
     }
 
     pub fn summary(&self) -> String {
         let (e0, p0, w5, w24) = self.derive_macs();
+        let f = self.pon_downlink_flags;
         format!(
-            "Device SN : {}\nLabel MAC : {}\neth0  (+1): {}\npon0  (+2): {}\n5G    (+4): {}\n2.4G  (+5): {}\ncalibration: {} bytes\neeprom    : {} bytes",
+            "Device SN : {}\nLabel MAC : {}\neth0  (+1): {}\npon0  (+2): {}\n5G    (+4): {}\n2.4G  (+5): {}\ncalibration: {} bytes\neeprom    : {} bytes\n下行PON   : {} bytes ({})\n  OBosaMode: {}\n  BosaFlag : {}\n  TempFlag : {}",
             self.device_sn,
             mac_to_string(&self.label_mac),
             mac_to_string(&e0),
@@ -191,8 +309,77 @@ impl Factory {
             mac_to_string(&w24),
             self.calibration.len(),
             self.wifi_eeprom.len(),
+            self.pon_downlink_cal.len(),
+            detect_downlink_chip(&self.pon_downlink_cal).unwrap_or_else(|| "未识别".into()),
+            f.obosa_mode,
+            f.bosa_flag,
+            f.temp_flag,
         )
     }
+}
+
+/// Identify the downlink optical module from the UX3326 calibration table.
+///
+/// The table is stored under the name `mmodified_UX3326.bin` inside mtd13's
+/// `ubifs1` volume, but that name is not part of the blob itself. Detection
+/// therefore relies on the one structural invariant that survives across
+/// calibration revisions: an 84-entry receive-sensitivity lookup table sitting
+/// at +0x70 of the 288-byte blob.
+///
+/// Note the entries are **big-endian** — the curve reads 220..318 (0x00dc..
+/// 0x013e) with `struct.unpack_from(">84H", ...)` and is garbage when read
+/// little-endian. All ten revisions preserved in this mtd13 agree on the
+/// offset, the entry count and the byte order.
+///
+/// `None` means the blob is blank (or too short) and carries no such table.
+pub fn detect_downlink_chip(cal: &[u8]) -> Option<String> {
+    if cal.len() < PON_DOWNLINK_CAL_SIZE || cal.iter().all(|&b| b == 0xff) {
+        return None;
+    }
+    find_sensitivity_lut(cal).map(|_| "UX3326".to_string())
+}
+
+/// Byte offset of the 84-entry big-endian receive-sensitivity LUT inside the
+/// UX3326 table. Verified identical across every ino 0x45 revision found in
+/// the sample mtd13 (0x2210a8 .. 0x225800).
+const PON_LUT_ENTRIES: usize = 84;
+
+/// Search for the sensitivity LUT; returns its offset when found.
+const LUT_SEARCH_FROM: usize = 0x60;
+
+fn find_sensitivity_lut(cal: &[u8]) -> Option<usize> {
+    let end = PON_DOWNLINK_CAL_SIZE - 7;
+    for start in (LUT_SEARCH_FROM..end).step_by(2) {
+        let lut = cal.get(start..start + PON_LUT_ENTRIES * 2)?;
+        if lut_is_sensitivity_lut(lut) {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// A real table: monotonically non-decreasing, starting above zero, never
+/// 0xffff (the erased-blob filler), and actually climbing at the tail.
+///
+/// The extra predicates matter because a constant fill (e.g. a buffer of 0x5a)
+/// trivially satisfies "non-decreasing" and would otherwise be misidentified
+/// as a real optical module.
+fn lut_is_sensitivity_lut(lut: &[u8]) -> bool {
+    if lut.len() < PON_LUT_ENTRIES * 2 {
+        return false;
+    }
+    let vals: Vec<u16> = lut
+        .chunks_exact(2)
+        .map(|p| u16::from_be_bytes([p[0], p[1]]))
+        .collect();
+    if vals[0] == 0 || vals.iter().any(|&v| v == 0xffff) {
+        return false;
+    }
+    if !vals.windows(2).all(|w| w[0] <= w[1]) {
+        return false;
+    }
+    // Strictly rising tail: the curve must actually climb, not sit flat.
+    vals.windows(2).skip(PON_LUT_ENTRIES - 9).any(|w| w[0] < w[1])
 }
 
 /// Parse a MAC from `aa:bb:cc:dd:ee:ff`, `aa-bb-...` or 12 raw hex digits.

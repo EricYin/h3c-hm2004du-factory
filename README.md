@@ -18,11 +18,59 @@ HM2004-DU 的 factory 是一个 UBI 卷（`ubi-volume-factory`，2_359_296 字�
 | `0x140005` | 6 | base MAC 占位 | `02:00:00:XX:00:00`（非真实地址） |
 | `0x14102c` | 12 | Device SN | ASCII，重复于 `0x14105f` |
 | `0x80000` | — | ctromfile (gzip) | 真实 label MAC 在 `AL-MAC="..."` 内 |
-| `0x1c0400` | 0x200 | PON 校准 | EN7572 / UX3326 BOSA |
+| `0x1c0400` | 0x200 | 上行 PON 校准 | EN7572 / UX3363 BOSA |
+| `0x1c1000` | 0x120 | 下行 PON 口校准 | UX3326 BOSA（源自 mtd13，见下节） |
+| `0x1c1120` | 6 | 下行 BOSA 标量 | OBosaMode / BosaFlag / TempFlag，各 u16 LE |
 | `0x4c000` | 0x1000 | Wi-Fi EEPROM | MT7916 DBDC |
 
 真实 label MAC **不**存在可寻址的 factory 字段里：原厂把出厂区相应槽位留空，MAC 只以 `AL-MAC` 形式存在于 `0x80000` 的 gzip ctromfile 中（与 `02_network::h3c_hm2004du_base_mac` 一致）。
 因此本工具**导入时解 gzip 取 `AL-MAC`**，**导出时在 `0x80000` 写明文 ctromfile 块**（便于对照，不重压缩）。
+
+## 下行 PON 口校准（mtd13 / UBIFS）
+
+下行 PON 口的光模块是 **UX3326 BOSA**，它的校准数据**不在 factory 分区里**，而在 **mtd13**。mtd13 是一个 4 MiB（`0x400000`）的 UBI 镜像，32 个 PEB（每个 `0x20000`），内含名为 `ubifs1` 的 UBIFS 动态卷，内含 `/bosa/` 目录树：
+
+| UBIFS inode | 文件 | 内容 |
+|------|------|------|
+| `0x45` | `mmodified_UX3326.bin` | `0x120`（288）字节校准 blob |
+| `0x42` | `OBosaMode` | u16 |
+| `0x43` | `BosaFlag` | u16 |
+| `0x44` | `TempFlag` | u16 |
+
+### 厂商魔改的 UBIFS 节点头
+
+与标准 UBIFS 不同（CRC32 也对不上，故本工具**不做校验**），实测布局为：
+
+| 偏移 | 字段 |
+|------|------|
+| `+0x00` | magic u32 = `0x06101831` |
+| `+0x04` | crc u32（不可校验，跳过） |
+| `+0x08` | sqnum u64 |
+| `+0x10` | len u32 |
+| `+0x14` | node_type u8（1=LEAF/DATA，2=DENT，5=PAD，6=SB，7=CMT） |
+| `+0x15` | group_type u8 |
+| `+0x18` | ino u32 |
+| `+0x28` | nodelen u32（= payload 长度，不含头部） |
+| `+0x30` | payload |
+
+### 两个必须注意的坑
+
+1. **必须按 `node_type == 1` 过滤。** mtd13 里有大量 CMT（`node_type=7`）提交节点，其载荷会被误读成 `ino`/`nodelen`，凭空造出几百条假记录并盖掉真实数据。
+2. **必须按 `sqnum` 取最新，而不是物理位置最后一份。** UBIFS 是日志结构，同一 inode 会有多个副本。样本 mtd13 中 ino `0x45` 有 10 个副本（`0x2210a8` sq=40 … `0x225800` sq=165），**最新的是 `0x225800`**。
+
+### 288 字节 blob 结构
+
+| 偏移 | 内容 |
+|------|------|
+| `+0x00` | 器件/工厂参数区（0x70 字节） |
+| `+0x70` | **84 项 u16 接收灵敏度 LUT，注意是大端** |
+| `+0x118` | 尾部保留 |
+
+灵敏度 LUT 用 `struct.unpack_from(">84H", cal, 0x70)` 读取，实测值域 `220..318`（`0x00dc..0x013e`），小端读出来是乱序。工具据此识别光模块型号——常量填充（例如全 `0x5a`）虽然也满足「非递减」，但缺少正值起点、无 `0xFFFF`、且尾部不爬升，因此不会被误判。
+
+样本 mtd13 中该 LUT 的偏移、项数、字节序在**全部 10 个 ino `0x45` 副本上完全一致**（早期副本值域 `316..456`，晚期 `220..318`）。
+
+> 注意：`0x1c1000` / `0x2200` 这些偏移描述的是**本工具自己的导出格式**——mtd13 不属于 `ubi-volume-factory`，没有可对应的真实分区偏移。原始定位由 `parse_mtd13()` 完成。
 
 ## MAC 派生（末字节偏移）
 
@@ -59,7 +107,9 @@ cargo build --release --features linux-x11
 
  界面仿上游 FiberHome 编辑器：顶栏「新建 / 打开 / 保存 1 MiB / 保存真实布局」+ 状态行，「身份信息」区（标签 MAC / 设备序列号，各带随机按钮），派生 MAC 只读表，PON 校准与 Wi-Fi EEPROM 为「替换 / 导出 / 清空」分组行。
 
-**PON 硬件由导入数据决定**：`PON 校准` 行的标题会显示从校准 blob 识别出的芯片——H3C 真机格式把型号以填充 ASCII 写在块内（实测 `0x1c0428` = `EN7572`，厂商 `ECONET` 因无数字被跳过）；若导入的是 FiberHome 的 `APONCAL` 格式则读 `0x0c` 芯片 ID（1=GN28L95、2=UX3363）；都识别不出时只显示「PON 校准」。这样换用其它光模块的备份会自动显示对应型号。
+**PON 硬件由导入数据决定**：`上行 PON 校准` 行的标题会显示从校准 blob 识别出的芯片——H3C 真机格式把型号以填充 ASCII 写在块内（实测 `0x1c0428` = `EN7572`，厂商 `ECONET` 因无数字被跳过）；若导入的是 FiberHome 的 `APONCAL` 格式则读 `0x0c` 芯片 ID（1=GN28L95、2=UX3363）；都识别不出时只显示「上行 PON 校准」。这样换用其它光模块的备份会自动显示对应型号。
+
+**下行 PON 口校准**单独成行（`下行 PON 口校准 (UX3326 BOSA)`），下面跟一个 `OBosaMode / BosaFlag / TempFlag` 三格标量区。「打开」时若选的是 **mtd13**，会自动走 UBIFS 解析取出行标最新（sqnum 最大）的 UX3326 blob 与三个标量，状态栏会报告来源偏移（如 `0x225800 +0x30`）；选 reservearea 备份则从 `0x1c1000` 读。两个方向的导出都会带上这块数据。
 
 ## Python 伴生工具（无需 Rust）
 
@@ -74,6 +124,13 @@ python3 h3c_factory_demo.py gen --layout true --sn H3CT0005EBF0 --mac 44:76:09:6
 
 # 从真实 reservearea 备份解析
 python3 h3c_factory_demo.py parse --bin mtd14_reservearea.bin
+
+# 从 mtd13 解析下行 PON 口校准
+python3 h3c_factory_demo.py parse --bin mtd13_h3c.bin
+
+# 把下行 PON 口校准一并打进 1 MiB 紧凑镜像（--poncal 接受 mtd13 或裸 288 字节 blob）
+python3 h3c_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a \
+    --poncal mtd13_h3c.bin -o factory-h3c-1mib.bin
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)。
@@ -92,10 +149,12 @@ python3 h3c_factory_demo.py parse --bin mtd14_reservearea.bin
 | `0x0050` | 6 | 2.4G = label+5 |
 | `0x0060` | 12 | Device SN (ASCII) |
 | `0x1000` | 0x1000 | Wi-Fi EEPROM (MT7916) |
-| `0x2000` | 0x200 | PON 校准 (EN7572) |
+| `0x2000` | 0x200 | 上行 PON 校准 (EN7572) |
+| `0x2200` | 0x120 | **下行 PON 口校准 (UX3326)** |
+| `0x2400` | 6 | 下行 BOSA 标量 OBosaMode / BosaFlag / TempFlag |
 | 其余 | — | `0xFF` 填充 |
 
-**2. 真实偏移布局镜像** — 1,839,104 字节（`0x1c1000`），字段落在与真机 factory 卷一致的偏移上，适合严格对照。
+**2. 真实偏移布局镜像** — 1,847,296 字节（`0x1c3000`），字段落在与真机 factory 卷一致的偏移上，适合严格对照。
 
 两种都**不可直接刷写 NAND**（不含 UBI 元数据、不重压缩 ctromfile）。
 

@@ -24,7 +24,9 @@ import sys
 import zlib
 
 FACTORY_VOLUME_SIZE = 0x240000
-DEMO_SIZE = 0x1C1000
+# 布局映射演示镜像大小：最高使用字段向上取整到 4 KiB。
+# 下行 PON 校准在 0x1c1000，长 0x120，紧跟其后 6 字节 BOSA 标量。
+DEMO_SIZE = 0x1C3000
 
 MAGIC_OFFSET = 0x140000
 MAGIC = bytes([0x21, 0x43, 0x34, 0x12])
@@ -39,6 +41,22 @@ CALIBRATION_SIZE = 0x200
 WIFI_EEPROM_OFFSET = 0x4C000
 WIFI_EEPROM_SIZE = 0x1000
 
+# ---- 下行 PON 口校准（mtd13 / UBIFS `ubifs1` 卷）----
+#
+# 下行 PON 口的光模块校准不在 factory 分区里，而是在 mtd13 —— 一个 4 MiB 的
+# UBI 镜像，内含名为 `ubifs1` 的 UBIFS 动态卷。逆向该卷得到目录树：
+#
+#   /bosa/OBosaMode              u16
+#   /bosa/BosaFlag               u16
+#   /bosa/TempFlag               u16
+#   /bosa/mmodified_UX3326.bin   0x120 字节 —— 下面这块
+#
+# mtd13 不属于 ubi-volume-factory，没有真实分区偏移；这里的常量描述的是我们
+# 自己的导出格式，原始定位由 parse_mtd13() 完成。
+PON_DOWNLINK_CAL_OFFSET = 0x1C1000
+PON_DOWNLINK_CAL_SIZE = 0x120
+PON_DOWNLINK_FLAGS_SIZE = 0x6
+
 # 1MiB 紧凑布局（自描述，不可刷写）：真实 H3C 身份字段在 0x140000+（超 1MiB），
 # 故按文档化偏移重排，magic "H3C-1MiB" 用于解析时自动识别。
 COMPACT_SIZE = 0x100000
@@ -51,6 +69,8 @@ C_WIFI24_MAC_OFFSET = 0x0050
 C_DEVICE_SN_OFFSET = 0x0060
 C_WIFI_EEPROM_OFFSET = 0x1000
 C_CALIBRATION_OFFSET = 0x2000
+C_PON_DOWNLINK_CAL_OFFSET = 0x2200
+C_PON_DOWNLINK_FLAGS_OFFSET = 0x2400
 
 # MAC 派生偏移 (末字节)
 OFF_ETH0, OFF_PON0, OFF_WIFI_5G, OFF_WIFI_24G = 1, 2, 4, 5
@@ -128,7 +148,133 @@ def detect_pon_chip(cal):
     return None
 
 
-def encode(sn, label_mac, calibration=None, eeprom=None):
+# ---- 下行 PON 口校准：mtd13 解析 -------------------------------------------------
+#
+# mtd13 是 4 MiB 的 UBI 镜像（32 个 PEB，每个 0x20000），内含 UBIFS 动态卷
+# `ubifs1`。厂商魔改了 UBIFS 节点头布局（与标准不符，CRC 也对不上，故不做
+# 校验），实测为：
+#
+#   +0x00 magic u32 = 0x06101831
+#   +0x04 crc   u32（不可校验，跳过）
+#   +0x08 sqnum  u64（越大越新）
+#   +0x10 len    u32
+#   +0x14 node_type u8（1=LEAF/DATA，2=DENT，7=CMT 提交节点）
+#   +0x15 group_type u8
+#   +0x18 ino    u32
+#   +0x28 nodelen u32
+#   +0x30 payload
+#
+# 关键点：同一 inode 会有多个副本（UBIFS 的日志语义），必须按 sqnum 取最新，
+# 而不是物理位置最靠后的那一份。
+
+UBIFS_NODE_MAGIC = 0x06101831
+UBIFS_NODE_HDR = 0x30
+UBIFS_NODE_LEAF = 1
+MTD13_SIZE = 0x400000
+INO_UX3326_BIN = 0x45
+INO_OBOSA_MODE = 0x42
+INO_BOSA_FLAG = 0x43
+INO_TEMP_FLAG = 0x44
+
+# UX3326 接收灵敏度 LUT：84 项 u16，**大端**，位于 blob +0x70。
+# 该结论在本 mtd13 的全部 10 个 ino 0x45 副本上一致。
+PON_LUT_ENTRIES = 84
+PON_LUT_OFFSET = 0x70
+PON_LUT_SEARCH_FROM = 0x60
+
+
+def looks_like_mtd13(data):
+    return len(data) >= MTD13_SIZE and data[:4] == b"UBI#"
+
+
+def _scan_ubifs_leaves(data):
+    """扫描 UBIFS LEAF 节点，同一 ino 按 sqnum 取最新。"""
+    best = {}
+    for off in range(0, len(data) - UBIFS_NODE_HDR, 4):
+        if int.from_bytes(data[off:off + 4], "little") != UBIFS_NODE_MAGIC:
+            continue
+        # 必须过滤 node_type==LEAF：CMT(7) 提交节点的载荷会被误读成 ino/nodelen，
+        # 凭空造出几百条假记录并盖掉真实数据。
+        if data[off + 0x14] != UBIFS_NODE_LEAF:
+            continue
+        sqnum = int.from_bytes(data[off + 0x08:off + 0x10], "little")
+        ino = int.from_bytes(data[off + 0x18:off + 0x1C], "little")
+        nodelen = int.from_bytes(data[off + 0x28:off + 0x2C], "little")
+        # 厂商魔改：nodelen 是 payload 长度（不含 0x30 头部），故上界按
+        # off + 0x30 + nodelen 判断，而不是 off + nodelen。
+        if nodelen > MTD13_SIZE or off + UBIFS_NODE_HDR + nodelen > len(data):
+            continue
+        prev = best.get(ino)
+        if prev is None or sqnum > prev[0]:
+            best[ino] = (sqnum, off, data[off + UBIFS_NODE_HDR:off + UBIFS_NODE_HDR + nodelen])
+    return best
+
+
+def _u16(payload):
+    return int.from_bytes(payload[:2], "little") if payload and len(payload) >= 2 else None
+
+
+def parse_mtd13(data):
+    """从 mtd13 提取下行 PON 校准。
+
+    返回 (cal_blob, flags_dict, source_offset)；非 mtd13 或找不到时返回 None。
+    """
+    if not looks_like_mtd13(data):
+        return None
+    nodes = _scan_ubifs_leaves(data)
+    cal = nodes.get(INO_UX3326_BIN)
+    if cal is None or len(cal[2]) < PON_DOWNLINK_CAL_SIZE:
+        return None
+    flags = {
+        "OBosaMode": _u16(nodes.get(INO_OBOSA_MODE, (0, 0, b""))[2]),
+        "BosaFlag": _u16(nodes.get(INO_BOSA_FLAG, (0, 0, b""))[2]),
+        "TempFlag": _u16(nodes.get(INO_TEMP_FLAG, (0, 0, b""))[2]),
+    }
+    return cal[2][:PON_DOWNLINK_CAL_SIZE], flags, cal[1]
+
+
+def pack_pon_downlink_flags(flags):
+    """flags dict -> 6 字节（OBosaMode/BosaFlag/TempFlag，各 u16 LE）。"""
+    out = bytearray()
+    for k in ("OBosaMode", "BosaFlag", "TempFlag"):
+        out += (int(flags.get(k) or 0) & 0xFFFF).to_bytes(2, "little")
+    return bytes(out)
+
+
+def unpack_pon_downlink_flags(raw):
+    if not raw or len(raw) < PON_DOWNLINK_FLAGS_SIZE:
+        return None
+    return {
+        "OBosaMode": int.from_bytes(raw[0:2], "little"),
+        "BosaFlag": int.from_bytes(raw[2:4], "little"),
+        "TempFlag": int.from_bytes(raw[4:6], "little"),
+    }
+
+
+def _is_sensitivity_lut(values):
+    if len(values) < PON_LUT_ENTRIES or values[0] == 0 or 0xFFFF in values:
+        return False
+    if not all(values[i] <= values[i + 1] for i in range(len(values) - 1)):
+        return False
+    # 尾部必须真的在爬升，否则常量填充（如 0x5a）会被误判成真实光模块
+    tail = values[-(PON_LUT_ENTRIES - 8):]
+    return any(tail[i] < tail[i + 1] for i in range(len(tail) - 1))
+
+
+def detect_downlink_chip(cal):
+    """从下行校准 blob 识别光模块（实测 UX3326）。"""
+    if not cal or len(cal) < PON_DOWNLINK_CAL_SIZE or all(b == 0xFF for b in cal):
+        return None
+    n = PON_LUT_ENTRIES
+    for start in range(PON_LUT_SEARCH_FROM, PON_DOWNLINK_CAL_SIZE - n * 2 + 1, 2):
+        vals = [int.from_bytes(cal[start + i * 2:start + i * 2 + 2], "big")
+                for i in range(n)]
+        if _is_sensitivity_lut(vals):
+            return "UX3326"
+    return None
+
+
+def encode(sn, label_mac, calibration=None, eeprom=None, downlink=None, downlink_flags=None):
     img = bytearray(b"\xff" * DEMO_SIZE)
     img[MAGIC_OFFSET:MAGIC_OFFSET + 4] = MAGIC
     img[BASE_MAC_OFFSET:BASE_MAC_OFFSET + 6] = label_mac
@@ -145,10 +291,27 @@ def encode(sn, label_mac, calibration=None, eeprom=None):
         img[CALIBRATION_OFFSET:CALIBRATION_OFFSET + len(calibration)] = calibration
     if eeprom:
         img[WIFI_EEPROM_OFFSET:WIFI_EEPROM_OFFSET + len(eeprom)] = eeprom
+    _write_downlink(img, PON_DOWNLINK_CAL_OFFSET, downlink, downlink_flags)
     return bytes(img)
 
 
-def encode_1mib(sn, label_mac, calibration=None, eeprom=None):
+def _write_downlink(img, base, downlink, downlink_flags, flags_offset=None):
+    """写入下行 PON 校准 blob 与 3×u16 BOSA 标量。
+
+    `flags_offset` 省略时标量紧贴 blob 尾部（真实偏移布局）；紧凑布局传入
+    独立的对齐偏移。
+    """
+    if downlink:
+        blob = bytes(downlink)[:PON_DOWNLINK_CAL_SIZE]
+        img[base:base + len(blob)] = blob
+    if downlink_flags is not None:
+        fb = pack_pon_downlink_flags(downlink_flags)
+        at = base + PON_DOWNLINK_CAL_SIZE if flags_offset is None else flags_offset
+        img[at:at + len(fb)] = fb
+
+
+def encode_1mib(sn, label_mac, calibration=None, eeprom=None, downlink=None,
+                downlink_flags=None):
     """1MiB 紧凑镜像：全部字段按文档化偏移重排进 1MiB，含 5 条 MAC 表。"""
     img = bytearray(b"\xff" * COMPACT_SIZE)
     img[0:len(COMPACT_MAGIC)] = COMPACT_MAGIC
@@ -166,6 +329,9 @@ def encode_1mib(sn, label_mac, calibration=None, eeprom=None):
         img[C_WIFI_EEPROM_OFFSET:C_WIFI_EEPROM_OFFSET + len(eeprom)] = eeprom
     if calibration:
         img[C_CALIBRATION_OFFSET:C_CALIBRATION_OFFSET + len(calibration)] = calibration
+    # 紧凑布局里 flags 有独立的对齐偏移（0x2400），而非紧贴 blob
+    _write_downlink(img, C_PON_DOWNLINK_CAL_OFFSET, downlink, downlink_flags,
+                    flags_offset=C_PON_DOWNLINK_FLAGS_OFFSET)
     return bytes(img)
 
 
@@ -244,10 +410,23 @@ def parse_compact(data):
         ).strip("\x00 ").strip()
     cal = data[C_CALIBRATION_OFFSET:C_CALIBRATION_OFFSET + CALIBRATION_SIZE]
     eep = data[C_WIFI_EEPROM_OFFSET:C_WIFI_EEPROM_OFFSET + WIFI_EEPROM_SIZE]
-    return sn, label, cal, eep
+    dn = data[C_PON_DOWNLINK_CAL_OFFSET:C_PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE]
+    dnf = unpack_pon_downlink_flags(
+        data[C_PON_DOWNLINK_FLAGS_OFFSET:C_PON_DOWNLINK_FLAGS_OFFSET + PON_DOWNLINK_FLAGS_SIZE]
+    )
+    return sn, label, cal, eep, dn, dnf
 
 
 def parse_volume(data):
+    # mtd13：下行 PON 校准的真实来源，直接走 UBIFS 解析
+    if looks_like_mtd13(data):
+        sn, label, cal, eep = "", None, b"", b""
+        parsed = parse_mtd13(data)
+        if parsed:
+            dn, dnf, _ = parsed
+        else:
+            dn, dnf = b"", None
+        return sn, label, cal, eep, dn, dnf
     # 1MiB 紧凑镜像自动识别
     if data[:8] == COMPACT_MAGIC:
         return parse_compact(data)
@@ -266,7 +445,15 @@ def parse_volume(data):
     label = read_label_mac(data)
     cal = data[CALIBRATION_OFFSET:CALIBRATION_OFFSET + CALIBRATION_SIZE] if len(data) >= CALIBRATION_OFFSET + CALIBRATION_SIZE else b""
     eep = data[WIFI_EEPROM_OFFSET:WIFI_EEPROM_OFFSET + WIFI_EEPROM_SIZE] if len(data) >= WIFI_EEPROM_OFFSET + WIFI_EEPROM_SIZE else b""
-    return sn, label, cal, eep
+    dn = b""
+    dnf = None
+    if len(data) >= PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE:
+        dn = data[PON_DOWNLINK_CAL_OFFSET:PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE]
+        dnf = unpack_pon_downlink_flags(
+            data[PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE:
+                 PON_DOWNLINK_CAL_OFFSET + PON_DOWNLINK_CAL_SIZE + PON_DOWNLINK_FLAGS_SIZE]
+        )
+    return sn, label, cal, eep, dn, dnf
 
 
 def main():
@@ -276,8 +463,12 @@ def main():
     g = sub.add_parser("gen", help="生成演示镜像 (1mib 紧凑 / true 真实布局)")
     g.add_argument("--sn", required=True)
     g.add_argument("--mac", required=True)
-    g.add_argument("--cal", help="校准 bin (可选)")
+    g.add_argument("--cal", help="上行 PON 校准 bin (可选)")
     g.add_argument("--eeprom", help="EEPROM bin (可选)")
+    g.add_argument(
+        "--poncal",
+        help="下行 PON 口校准：mtd13_h3c.bin，或已抽出的 0x120 字节 UX3326 blob (可选)",
+    )
     g.add_argument(
         "--layout",
         choices=["1mib", "true"],
@@ -286,7 +477,7 @@ def main():
     )
     g.add_argument("-o", "--out", default="factory-h3c-1mib.bin")
 
-    p = sub.add_parser("parse", help="解析真实 reservearea 备份")
+    p = sub.add_parser("parse", help="解析真实 reservearea 备份或 mtd13")
     p.add_argument("--bin", required=True)
 
     args = ap.parse_args()
@@ -301,10 +492,30 @@ def main():
             )
         cal = open(args.cal, "rb").read() if args.cal else None
         eep = open(args.eeprom, "rb").read() if args.eeprom else None
+        dn, dnf = None, None
+        if args.poncal:
+            raw = open(args.poncal, "rb").read()
+            if raw[:4] == b"UBI#":
+                parsed = parse_mtd13(raw)
+                if not parsed:
+                    sys.exit("未在 %s 中找到 UX3326 下行校准" % args.poncal)
+                dn, dnf, src = parsed
+                print("下行校准来源: %s +0x30 (%d 字节)" % (args.poncal, len(dn)))
+            else:
+                dn = raw[:PON_DOWNLINK_CAL_SIZE]
+            print(
+                "下行 PON 校准: %d 字节, OBosaMode=%s BosaFlag=%s TempFlag=%s"
+                % (
+                    len(dn),
+                    (dnf or {}).get("OBosaMode"),
+                    (dnf or {}).get("BosaFlag"),
+                    (dnf or {}).get("TempFlag"),
+                )
+            )
         if args.layout == "1mib":
-            img = encode_1mib(args.sn, mac, cal, eep)
+            img = encode_1mib(args.sn, mac, cal, eep, dn, dnf)
         else:
-            img = encode(args.sn, mac, cal, eep)
+            img = encode(args.sn, mac, cal, eep, dn, dnf)
         open(args.out, "wb").write(img)
         e0 = derive_mac(mac, OFF_ETH0)
         p0 = derive_mac(mac, OFF_PON0)
@@ -317,10 +528,18 @@ def main():
         print("  pon0  +2  : %s" % mac_to_string(p0))
         print("  5G    +4  : %s" % mac_to_string(w5))
         print("  2.4G  +5  : %s" % mac_to_string(w24))
+        if dn is not None:
+            print("  下行 PON  : %s, %d 字节" % (detect_downlink_chip(dn) or "<未识别>", len(dn)))
     elif args.cmd == "parse":
         data = open(args.bin, "rb").read()
-        sn, label, cal, eep = parse_volume(data)
-        print("文件: %s (%d 字节)" % (args.bin, len(data)))
+        src = ""
+        if looks_like_mtd13(data):
+            parsed = parse_mtd13(data)
+            if parsed:
+                _, _, off = parsed
+                src = "  (UBIFS 最新副本 @0x%06x +0x30, sqnum 取最大)" % off
+        sn, label, cal, eep, dn, dnf = parse_volume(data)
+        print("文件: %s (%d 字节)%s" % (args.bin, len(data), src))
         print("  Device SN : %r" % sn)
         print("  Label MAC : %s" % (mac_to_string(label) if label else "<未找到>"))
         if label:
@@ -329,9 +548,16 @@ def main():
             print("  5G    +4  : %s" % mac_to_string(derive_mac(label, OFF_WIFI_5G)))
             print("  2.4G  +5  : %s" % mac_to_string(derive_mac(label, OFF_WIFI_24G)))
         chip = detect_pon_chip(cal)
-        print("  PON 芯片   : %s" % (chip if chip else "<未识别/未设置>"))
-        print("  calibration: %d 字节" % len(cal))
+        print("  上行 PON 芯片: %s" % (chip if chip else "<未识别/未设置>"))
+        print("  上行 calibration: %d 字节" % len(cal))
         print("  eeprom    : %d 字节" % len(eep))
+        print("  下行 PON 芯片: %s" % (detect_downlink_chip(dn) or "<未识别/未设置>"))
+        print("  下行 calibration: %d 字节" % len(dn))
+        if dnf:
+            print(
+                "  BOSA 标志: OBosaMode=%(OBosaMode)s BosaFlag=%(BosaFlag)s "
+                "TempFlag=%(TempFlag)s" % dnf
+            )
     else:
         ap.print_help()
 

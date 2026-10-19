@@ -18,8 +18,9 @@ mod model;
 
 use eframe::egui;
 use model::{
-    Factory, CALIBRATION_SIZE, OFF_ETH0, OFF_PON0, OFF_WIFI_24G, OFF_WIFI_5G, WIFI_EEPROM_SIZE,
-    derive_mac, detect_pon_chip, mac_to_string, parse_mac, random_mac, random_sn,
+    detect_downlink_chip, detect_pon_chip, derive_mac, mac_to_string, parse_mac, random_mac,
+    random_sn, Factory, PON_DOWNLINK_CAL_SIZE, CALIBRATION_SIZE, OFF_ETH0, OFF_PON0,
+    OFF_WIFI_24G, OFF_WIFI_5G, WIFI_EEPROM_SIZE,
 };
 use rfd::FileDialog;
 use std::path::Path;
@@ -52,6 +53,22 @@ impl Editor {
             }
         }
     }
+
+    /// Load a `.bin`, reporting which flavour it turned out to be so the user
+    /// knows whether the downlink calibration actually got picked up.
+    fn open_file(&mut self, bytes: &[u8], name: &str) {
+        let is_mtd13 = import::looks_like_mtd13(bytes);
+        let src = import::downlink_source_offset(bytes);
+        self.factory = import::parse_factory_volume(bytes);
+        self.sync_from_factory();
+        self.msg = match (is_mtd13, src) {
+            (true, Some(off)) => format!(
+                "已打开 mtd13: {name} · 下行 PON 校准取自 UBIFS 记录 0x{off:06x}"
+            ),
+            (true, None) => format!("已打开 mtd13: {name} · 未找到 /bosa/ 校准表"),
+            (false, _) => format!("已打开: {name}"),
+        };
+    }
 }
 
 impl eframe::App for Editor {
@@ -74,9 +91,8 @@ impl eframe::App for Editor {
                     if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
                         match std::fs::read(&p) {
                             Ok(b) => {
-                                self.factory = import::parse_factory_volume(&b);
-                                self.sync_from_factory();
-                                self.msg = format!("已打开: {}", p.display());
+                                let name = p.display().to_string();
+                                self.open_file(&b, &name);
                             }
                             Err(e) => self.msg = format!("读取失败: {e}"),
                         }
@@ -141,8 +157,8 @@ impl eframe::App for Editor {
         ui.add_space(8.0);
         // The chip is named by the imported calibration, not hardcoded.
         let pon_title = match detect_pon_chip(&self.factory.calibration) {
-            Some(chip) => format!("PON 校准 ({chip})"),
-            None => "PON 校准".to_string(),
+            Some(chip) => format!("上行 PON 校准 ({chip})"),
+            None => "上行 PON 校准".to_string(),
         };
         blob_section(
             ui,
@@ -151,6 +167,35 @@ impl eframe::App for Editor {
             CALIBRATION_SIZE,
             &mut self.msg,
         );
+
+        // ---- 下行 PON 口校准 (mtd13 / UX3326 BOSA) ----
+        let down_title = match detect_downlink_chip(&self.factory.pon_downlink_cal) {
+            Some(chip) => format!("下行 PON 口校准 ({chip} BOSA)"),
+            None => "下行 PON 口校准".to_string(),
+        };
+        blob_section(
+            ui,
+            &down_title,
+            &mut self.factory.pon_downlink_cal,
+            PON_DOWNLINK_CAL_SIZE,
+            &mut self.msg,
+        );
+        let f = self.factory.pon_downlink_flags;
+        egui::Grid::new("bosa_flags")
+            .num_columns(2)
+            .spacing([16.0, 3.0])
+            .show(ui, |ui| {
+                ui.weak("OBosaMode");
+                ui.monospace(format!("0x{:04X} ({})", f.obosa_mode, f.obosa_mode));
+                ui.end_row();
+                ui.weak("BosaFlag");
+                ui.monospace(format!("0x{:04X} ({})", f.bosa_flag, f.bosa_flag));
+                ui.end_row();
+                ui.weak("TempFlag");
+                ui.monospace(format!("0x{:04X} ({})", f.temp_flag, f.temp_flag));
+                ui.end_row();
+            });
+
         blob_section(
             ui,
             "Wi-Fi EEPROM (MT7916)",
@@ -161,7 +206,8 @@ impl eframe::App for Editor {
 
         ui.add_space(8.0);
         ui.weak("导出为演示镜像（不含 UBI 元数据、不重压缩 ctromfile），不可直接刷写 NAND。");
-        ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · 校准@0x1c0400 · EEPROM@0x4c000");
+        ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · 上行校准@0x1c0400 · 下行校准@0x1c1000 · EEPROM@0x4c000");
+        ui.weak("下行 PON 校准原始来源为 mtd13 的 UBIFS 卷 ubifs1（/bosa/mmodified_UX3326.bin，288 字节，取 sqnum 最新副本）。");
     }
 }
 
@@ -245,9 +291,8 @@ fn main() -> eframe::Result {
             if let Some(path) = std::env::args_os().nth(1) {
                 match std::fs::read(&path) {
                     Ok(bytes) => {
-                        ed.factory = import::parse_factory_volume(&bytes);
-                        ed.sync_from_factory();
-                        ed.msg = format!("已打开: {}", Path::new(&path).display());
+                        let name = Path::new(&path).display().to_string();
+                        ed.open_file(&bytes, &name);
                     }
                     Err(e) => ed.msg = format!("读取失败: {e}"),
                 }
