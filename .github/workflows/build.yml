@@ -94,7 +94,7 @@ jobs:
           name: ${{ github.event_name == 'workflow_dispatch' && 'Latest' || 'nightly' }}
           prerelease: ${{ github.event_name != 'workflow_dispatch' }}
           make_latest: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-          generate_release_notes: true
+          generate_release_notes: false
           overwrite_files: true
           files: |
             dist/**
