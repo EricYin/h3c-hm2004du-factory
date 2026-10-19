@@ -355,6 +355,32 @@ fn blob_section(
     ui.add_space(4.0);
 }
 
+/// The application's colour scheme.
+///
+/// Two things are needed, and both matter:
+///
+/// 1. `ctx.set_theme(Theme::Light)` — this flips the *style* selection, so all
+///    widgets, panels and popups are laid out and coloured for a light
+///    background. Toggling `Visuals::dark_mode` alone does almost nothing
+///    (egui documents that field as "a convenient summary of the rest").
+/// 2. `ctx.set_visuals_of(Theme::Light, light_visuals())` — the stock light
+///    palette leaves `weak` text (statuses, hints, source labels) a very
+///    low-contrast grey that is hard to read, so darken it. Writing it to the
+///    light style explicitly also makes this independent of call order.
+fn light_visuals() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    // `weak` text is used for statuses, hints and the source labels; the stock
+    // light value is a low-contrast grey, so darken it to keep it legible.
+    v.weak_text_color = egui::Color32::from_gray(110);
+    v.widgets.inactive.bg_fill = egui::Color32::from_gray(225);
+    v.widgets.hovered.bg_fill = egui::Color32::from_gray(205);
+    v.widgets.active.bg_fill = egui::Color32::from_gray(190);
+    v.panel_fill = egui::Color32::WHITE;
+    v.window_fill = egui::Color32::WHITE;
+    v.window_stroke.color = egui::Color32::from_gray(150);
+    v
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -367,10 +393,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
-            // 亮色主题。egui 默认跟随系统，深色环境下窗口会偏暗；这里显式
-            // 固定为 Light，让「弱化」文字（来源、状态、说明）在白底上仍然
-            // 保持足够对比度。
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            // 固定亮色，顺序与 API 都要讲究：
+            //   * `set_theme(Light)` 让 theme_preference 变成 Light，
+            //     `Options::theme()` 不再回落到系统的 system_theme；
+            //   * `set_visuals_of(Light, ..)` 直接写 light style，不依赖
+            //     `theme()` 当前返回什么，因此与调用顺序无关。
+            // 只调 `set_visuals(Visuals::light())` 在系统为深色时会写进
+            // dark style，而 UI 读的是 dark style —— 就是「半深半浅」的成因。
+            cc.egui_ctx.set_visuals_of(egui::Theme::Light, light_visuals());
+            cc.egui_ctx.set_theme(egui::Theme::Light);
             let mut ed = Editor {
                 factory: Factory::new(),
                 device_sn: String::new(),
