@@ -109,7 +109,25 @@ cargo build --release --features linux-x11
 
 **PON 硬件由导入数据决定**：`上行 PON 校准` 行的标题会显示从校准 blob 识别出的芯片——H3C 真机格式把型号以填充 ASCII 写在块内（实测 `0x1c0428` = `EN7572`，厂商 `ECONET` 因无数字被跳过）；若导入的是 FiberHome 的 `APONCAL` 格式则读 `0x0c` 芯片 ID（1=GN28L95、2=UX3363）；都识别不出时只显示「上行 PON 校准」。这样换用其它光模块的备份会自动显示对应型号。
 
-**下行 PON 口校准**单独成行（`下行 PON 口校准 (UX3326 BOSA)`），下面跟一个 `OBosaMode / BosaFlag / TempFlag` 三格标量区。「打开」时若选的是 **mtd13**，会自动走 UBIFS 解析取出行标最新（sqnum 最大）的 UX3326 blob 与三个标量，状态栏会报告来源偏移（如 `0x225800 +0x30`）；选 reservearea 备份则从 `0x1c1000` 读。两个方向的导出都会带上这块数据。
+**出厂校准分散在两个分区**，因此顶栏提供两个独立入口，**任意顺序打开都互不覆盖**：
+
+| 按钮 | 目标分区 | 载入内容 |
+|------|------|------|
+| `打开出厂区 (mtd14)` | `mtd14_reservearea.bin` | 标签 MAC、设备 SN、上行 PON 校准、Wi-Fi EEPROM |
+| `打开下行校准 (mtd13)` | `mtd13_h3c.bin` | 下行 PON 口校准 blob + OBosaMode/BosaFlag/TempFlag |
+| `打开…` | 自动按内容识别 | 等价于上面两个之一 |
+
+关键行为：**真实 mtd14 不含下行数据**，所以打开它时不会用 `0xFF` 抹掉已经从 mtd13 载入的下行校准；反之打开 mtd13 也不会动身份信息与上行校准。导出的 1 MiB 镜像同时包含两个分区的数据。
+
+也可在命令行一次传两个文件（顺序任意）：
+
+```bash
+h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+# Linux/macOS
+./h3c-hm2004du-factory mtd14_reservearea.bin mtd13_h3c.bin
+```
+
+状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。界面为**亮色主题**（egui 默认跟随系统，此处显式固定为 Light）。
 
 ## Python 伴生工具（无需 Rust）
 

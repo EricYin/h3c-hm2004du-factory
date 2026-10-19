@@ -30,6 +30,10 @@ struct Editor {
     device_sn: String,
     label_mac: String,
     msg: String,
+    /// 已载入的出厂区（mtd14 / reservearea）文件名，用于状态栏与摘要。
+    src_factory: Option<String>,
+    /// 已载入的下行 PON 分区（mtd13）文件名。
+    src_downlink: Option<String>,
 }
 
 impl Editor {
@@ -54,20 +58,55 @@ impl Editor {
         }
     }
 
-    /// Load a `.bin`, reporting which flavour it turned out to be so the user
-    /// knows whether the downlink calibration actually got picked up.
-    fn open_file(&mut self, bytes: &[u8], name: &str) {
-        let is_mtd13 = import::looks_like_mtd13(bytes);
-        let src = import::downlink_source_offset(bytes);
-        self.factory = import::parse_factory_volume(bytes);
+    /// Load the **factory / reservearea** partition (mtd14): identity, uplink
+    /// PON calibration and Wi-Fi EEPROM.
+    ///
+    /// The downlink block is deliberately *not* clobbered when this dump has
+    /// none: a real mtd14 has no downlink data, and overwriting a good mtd13
+    /// import with 0xFF would silently undo it. Only a dump that actually
+    /// carries downlink bytes is allowed to replace them.
+    fn open_factory(&mut self, bytes: &[u8], name: &str) {
+        let parsed = import::parse_factory_volume(bytes);
+        let parsed_has_downlink = parsed.pon_downlink_cal.iter().any(|&b| b != 0xff);
+        if !parsed_has_downlink {
+            // Preserve whatever mtd13 gave us.
+            parsed.pon_downlink_cal = std::mem::take(&mut self.factory.pon_downlink_cal);
+            parsed.pon_downlink_flags = self.factory.pon_downlink_flags;
+        }
+        self.factory = parsed;
         self.sync_from_factory();
-        self.msg = match (is_mtd13, src) {
-            (true, Some(off)) => format!(
-                "已打开 mtd13: {name} · 下行 PON 校准取自 UBIFS 记录 0x{off:06x}"
-            ),
-            (true, None) => format!("已打开 mtd13: {name} · 未找到 /bosa/ 校准表"),
-            (false, _) => format!("已打开: {name}"),
-        };
+        self.src_factory = Some(name.to_string());
+        self.msg = format!("已打开出厂区: {name}");
+        if let Some(d) = &self.src_downlink {
+            self.msg.push_str(&format!(" · 下行 PON 保留自 {d}"));
+        }
+    }
+
+    /// Load the **downlink PON** partition (mtd13): the UX3326 BOSA blob plus
+    /// the OBosaMode / BosaFlag / TempFlag scalars. Nothing else is touched, so
+    /// it is safe to open in either order.
+    fn open_downlink(&mut self, bytes: &[u8], name: &str) {
+        match import::parse_mtd13(bytes) {
+            Some((cal, flags, off)) => {
+                self.factory.pon_downlink_cal = cal;
+                self.factory.pon_downlink_flags = flags;
+                self.src_downlink = Some(name.to_string());
+                self.msg =
+                    format!("已打开下行 PON 分区: {name} · UBIFS 记录 0x{off:06x}（sqnum 最新副本）");
+            }
+            None => {
+                self.msg = format!("已打开: {name} · 但未找到 /bosa/ 校准表（不是 mtd13？）");
+            }
+        }
+    }
+
+    /// Dispatch on content so the user can pick either file in the same dialog.
+    fn open_auto(&mut self, bytes: &[u8], name: &str) {
+        if import::looks_like_mtd13(bytes) {
+            self.open_downlink(bytes, name);
+        } else {
+            self.open_factory(bytes, name);
+        }
     }
 }
 
@@ -87,12 +126,36 @@ impl eframe::App for Editor {
                     let img = self.factory.encode();
                     self.save_image(img, "factory-h3c-layout.bin");
                 }
-                if ui.button("打开").clicked() {
+                if ui.button("打开…").clicked() {
                     if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
                         match std::fs::read(&p) {
                             Ok(b) => {
                                 let name = p.display().to_string();
-                                self.open_file(&b, &name);
+                                self.open_auto(&b, &name);
+                            }
+                            Err(e) => self.msg = format!("读取失败: {e}"),
+                        }
+                    }
+                }
+                // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
+                // 互不覆盖（见 open_factory / open_downlink）。
+                if ui.button("打开出厂区 (mtd14)").clicked() {
+                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
+                        match std::fs::read(&p) {
+                            Ok(b) => {
+                                let name = p.display().to_string();
+                                self.open_factory(&b, &name);
+                            }
+                            Err(e) => self.msg = format!("读取失败: {e}"),
+                        }
+                    }
+                }
+                if ui.button("打开下行校准 (mtd13)").clicked() {
+                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
+                        match std::fs::read(&p) {
+                            Ok(b) => {
+                                let name = p.display().to_string();
+                                self.open_downlink(&b, &name);
                             }
                             Err(e) => self.msg = format!("读取失败: {e}"),
                         }
@@ -101,11 +164,27 @@ impl eframe::App for Editor {
                 if ui.button("新建").clicked() {
                     self.factory = Factory::new();
                     self.sync_from_factory();
+                    self.src_factory = None;
+                    self.src_downlink = None;
                     self.msg = "新建 Factory".into();
                 }
             });
         });
         ui.label(&self.msg);
+        ui.separator();
+
+        // 已载入来源：让用户一眼看出两个分区是否都到位
+        egui::Grid::new("sources")
+            .num_columns(2)
+            .spacing([16.0, 2.0])
+            .show(ui, |ui| {
+                ui.weak("出厂区 (mtd14)");
+                ui.monospace(self.src_factory.as_deref().unwrap_or("<未载入>"));
+                ui.end_row();
+                ui.weak("下行校准 (mtd13)");
+                ui.monospace(self.src_downlink.as_deref().unwrap_or("<未载入>"));
+                ui.end_row();
+            });
         ui.separator();
 
         // 折叠式摘要：打开文件后一眼看清各项是否真的载入（含下行 PON 校准）
@@ -213,6 +292,7 @@ impl eframe::App for Editor {
         );
 
         ui.add_space(8.0);
+        ui.weak("出厂校准分散在两个分区：上行/身份/EEPROM 在 mtd14（reservearea），下行 PON 口校准在 mtd13（UBIFS）。两个文件可任意顺序打开，互不覆盖。");
         ui.weak("导出为演示镜像（不含 UBI 元数据、不重压缩 ctromfile），不可直接刷写 NAND。");
         ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · 上行校准@0x1c0400 · 下行校准@0x1c1000 · EEPROM@0x4c000");
         ui.weak("下行 PON 校准原始来源为 mtd13 的 UBIFS 卷 ubifs1（/bosa/mmodified_UX3326.bin，288 字节，取 sqnum 最新副本）。");
@@ -278,8 +358,8 @@ fn blob_section(
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 480.0])
-            .with_min_inner_size([560.0, 420.0]),
+            .with_inner_size([720.0, 760.0])
+            .with_min_inner_size([640.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -287,23 +367,37 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
+            // 亮色主题。egui 默认跟随系统，深色环境下窗口会偏暗；这里显式
+            // 固定为 Light，让「弱化」文字（来源、状态、说明）在白底上仍然
+            // 保持足够对比度。
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
             let mut ed = Editor {
                 factory: Factory::new(),
                 device_sn: String::new(),
                 label_mac: String::new(),
                 msg: "新建 Factory".to_string(),
+                src_factory: None,
+                src_downlink: None,
             };
             ed.sync_from_factory();
             // Like upstream: allow `h3c-hm2004du-factory.exe backup.bin`
             // (or dragging a .bin onto the exe) to open a file directly.
-            if let Some(path) = std::env::args_os().nth(1) {
+            // Multiple paths may be given, which is how a real unit's two
+            // partitions get loaded in one go:
+            //   h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+            let mut loaded = 0usize;
+            for path in std::env::args_os().skip(1) {
                 match std::fs::read(&path) {
                     Ok(bytes) => {
                         let name = Path::new(&path).display().to_string();
-                        ed.open_file(&bytes, &name);
+                        ed.open_auto(&bytes, &name);
+                        loaded += 1;
                     }
-                    Err(e) => ed.msg = format!("读取失败: {e}"),
+                    Err(e) => ed.msg = format!("读取失败 {}: {e}", Path::new(&path).display()),
                 }
+            }
+            if loaded == 0 {
+                ed.msg = "新建 Factory（可打开 mtd14 出厂区 + mtd13 下行校准两个文件）".into();
             }
             Ok(Box::new(ed))
         }),

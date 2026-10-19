@@ -42,7 +42,7 @@ pub fn parse_factory_volume(data: &[u8]) -> Factory {
     // If this happens to be an mtd13 dump we can still lift the downlink
     // calibration out of it; a plain reservearea backup simply yields blank.
     let (pon_downlink_cal, pon_downlink_flags) = match parse_mtd13(data) {
-        Some(cal) => cal,
+        Some((cal, flags, _off)) => (cal, flags),
         None => read_downlink_from_layout(data),
     };
 
@@ -301,33 +301,27 @@ pub fn looks_like_mtd13(data: &[u8]) -> bool {
 ///
 /// Returns `(mmodified_UX3326.bin 的 288 字节载荷, OBosaMode/BosaFlag/TempFlag)`,
 /// or `None` when the image is not an mtd13 dump or carries no `/bosa/` table.
-pub fn parse_mtd13(data: &[u8]) -> Option<(Vec<u8>, PonDownlinkFlags)> {
+/// Extract the downlink PON calibration from an mtd13 image.
+///
+/// Returns `(calibration blob, BOSA flags, source offset)`. The offset is the
+/// byte position of the winning UBIFS record, which the GUI reports so the user
+/// can tell *which* copy of the many revisions in the journal was used.
+pub fn parse_mtd13(data: &[u8]) -> Option<(Vec<u8>, PonDownlinkFlags, usize)> {
     if !looks_like_mtd13(data) {
         return None;
     }
     let nodes = scan_ubifs_leaves(data);
-    let cal = latest_payload(&nodes, INO_UX3326_BIN)?;
-    if cal.len() < PON_DOWNLINK_CAL_SIZE {
+    let node = nodes.iter().find(|n| n.ino == INO_UX3326_BIN)?;
+    if node.payload.len() < PON_DOWNLINK_CAL_SIZE {
         return None;
     }
+    let cal = node.payload[..PON_DOWNLINK_CAL_SIZE].to_vec();
     let flags = PonDownlinkFlags {
         obosa_mode: read_u16(latest_payload(&nodes, INO_OBOSA_MODE)),
         bosa_flag: read_u16(latest_payload(&nodes, INO_BOSA_FLAG)),
         temp_flag: read_u16(latest_payload(&nodes, INO_TEMP_FLAG)),
     };
-    Some((cal[..PON_DOWNLINK_CAL_SIZE].to_vec(), flags))
-}
-
-/// Where in the mtd13 image the winning UX3326 record was found. Useful for
-/// telling the user which copy the data came from when auditing a dump.
-pub fn downlink_source_offset(data: &[u8]) -> Option<usize> {
-    if !looks_like_mtd13(data) {
-        return None;
-    }
-    scan_ubifs_leaves(data)
-        .iter()
-        .find(|n| n.ino == INO_UX3326_BIN)
-        .map(|n| n.off)
+    Some((cal, flags, node.off))
 }
 
 fn read_u16(p: Option<&[u8]>) -> u16 {
