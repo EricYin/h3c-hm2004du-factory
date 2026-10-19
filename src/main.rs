@@ -66,7 +66,7 @@ impl Editor {
     /// import with 0xFF would silently undo it. Only a dump that actually
     /// carries downlink bytes is allowed to replace them.
     fn open_factory(&mut self, bytes: &[u8], name: &str) {
-        let parsed = import::parse_factory_volume(bytes);
+        let mut parsed = import::parse_factory_volume(bytes);
         let parsed_has_downlink = parsed.pon_downlink_cal.iter().any(|&b| b != 0xff);
         if !parsed_has_downlink {
             // Preserve whatever mtd13 gave us.
