@@ -684,11 +684,11 @@ fn main() -> eframe::Result {
                 gud: Vec::new(),
             };
             ed.sync_from_factory();
-            // Like upstream: allow `h3c-hm2004du-factory.exe backup.bin`
+            // Like upstream: allow `h3c-factory.exe backup.bin`
             // (or dragging a .bin onto the exe) to open a file directly.
             // Multiple paths may be given, which is how a real unit's two
             // partitions get loaded in one go:
-            //   h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+            //   h3c-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
             let mut loaded = 0usize;
             for path in std::env::args_os().skip(1) {
                 match std::fs::read(&path) {

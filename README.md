@@ -133,9 +133,9 @@ cargo build --release --features linux-x11
 也可在命令行一次传两个文件（顺序任意）：
 
 ```bash
-h3c-hm2004du-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+h3c-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
 # Linux/macOS
-./h3c-hm2004du-factory mtd14_reservearea.bin mtd13_h3c.bin
+./h3c-factory mtd14_reservearea.bin mtd13_h3c.bin
 ```
 
 状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。
@@ -183,6 +183,9 @@ python3 h3c_factory_demo.py hl202 --bin mtd12.bin -o factory-hl202-512k.bin
 python3 h3c_factory_demo.py hl202 --bin mtd12.bin \
     --sn H3CT091030F8 --mac 44:76:09:10:30:f8 -o factory-hl202-512k.bin
 ```
+
+示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
+[`examples/factory-hl202-demo-512k.bin`](examples/factory-hl202-demo-512k.bin)。
 
 工具支持两种导出格式（解析时按 magic 自动识别）：
 
@@ -266,7 +269,7 @@ GUD 里**只搬运 SN 和 MAC**（label + 4 个派生值），SSID / 密码 / �
 ## 目录结构
 
 ```
-h3c-hm2004du-factory/
+h3c-factory/
 ├── Cargo.toml
 ├── Cargo.lock                 # 锁定 egui/eframe 0.36.2
 ├── LICENSE                    # GPL-2.0-only
@@ -279,7 +282,10 @@ h3c-hm2004du-factory/
 │   ├── model.rs     # HM2004-DU 布局常量 + Factory + encode
 │   ├── hl202.rs     # HL202-DU 布局常量 + Hl202 + encode_compact（512 KiB）
 │   └── import.rs    # 解析真实 factory 卷 / mtd13 UBIFS
-└── h3c_factory_demo.py
+├── h3c_factory_demo.py
+└── examples/
+    ├── factory-h3c-demo.bin          # 主机 1 MiB 示例
+    └── factory-hl202-demo-512k.bin   # 从机 512 KiB 示例
 ```
 
 ## 进阶：生成可刷写卷

@@ -892,7 +892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3c-hm2004du-factory"
+name = "h3c-factory"
 version = "0.1.0"
 dependencies = [
  "eframe",
