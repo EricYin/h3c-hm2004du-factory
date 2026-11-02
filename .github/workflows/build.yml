@@ -1,4 +1,4 @@
-name: Build H3C HM2004-DU Factory
+name: Build H3C Factory
 
 on:
   push:
