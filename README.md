@@ -184,9 +184,6 @@ python3 h3c_factory_demo.py hl202 --bin mtd12.bin \
     --sn H3CT091030F8 --mac 44:76:09:10:30:f8 -o factory-hl202-512k.bin
 ```
 
-示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
-[`examples/factory-hl202-demo-512k.bin`](examples/factory-hl202-demo-512k.bin)。
-
 工具支持两种导出格式（解析时按 magic 自动识别）：
 
 **1. 1 MiB 紧凑镜像（默认）** — 1,048,576 字节。真实 H3C 字段位于 `0x140000+`（超出 1 MiB），无法按真实偏移塞进 1 MiB，故采用自描述紧凑布局（magic `H3C-1MiB`），**所有字段全部保留**：
@@ -282,10 +279,7 @@ h3c-hm2004du-factory/
 │   ├── model.rs     # HM2004-DU 布局常量 + Factory + encode
 │   ├── hl202.rs     # HL202-DU 布局常量 + Hl202 + encode_compact（512 KiB）
 │   └── import.rs    # 解析真实 factory 卷 / mtd13 UBIFS
-├── h3c_factory_demo.py
-└── examples/
-    ├── factory-h3c-demo.bin          # 主机 1 MiB 示例
-    └── factory-hl202-demo-512k.bin   # 从机 512 KiB 示例
+└── h3c_factory_demo.py
 ```
 
 ## 进阶：生成可刷写卷
