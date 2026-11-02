@@ -107,7 +107,7 @@ fn read_mac6(data: &[u8], off: usize) -> Option<[u8; 6]> {
 
 /// The AL-MAC region contents: the *inflated* gzip ctromfile for a real backup,
 /// or the raw region when it is already plain text (our own demo export).
-fn read_almac_bytes(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn read_almac_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let region = data.get(ALMAC_REGION_OFFSET..)?;
     if let Some(start) = find_subseq(region, &[0x1f, 0x8b, 0x08]) {
         let mut out = Vec::new();
@@ -140,7 +140,7 @@ fn read_device_sn(data: &[u8]) -> String {
 }
 
 /// Last resort: the base-MAC placeholder at 0x140005.
-fn read_base_mac_placeholder(data: &[u8]) -> Option<[u8; 6]> {
+pub(crate) fn read_base_mac_placeholder(data: &[u8]) -> Option<[u8; 6]> {
     let m = data.get(BASE_MAC_OFFSET..BASE_MAC_OFFSET + BASE_MAC_SIZE)?;
     if m.iter().any(|&b| b != 0xff && b != 0x00) {
         let mut a = [0u8; 6];

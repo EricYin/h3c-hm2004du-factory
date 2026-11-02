@@ -33,7 +33,14 @@ MAGIC = bytes([0x21, 0x43, 0x34, 0x12])
 BASE_MAC_OFFSET = 0x140005
 DEVICE_SN_OFFSET = 0x14102C
 DEVICE_SN_DUP_OFFSET = 0x14105F
+# 槽位物理宽度 16 字节：原厂 mtd14 在 0x14102c 放的是 H3CT0005EBF068CU。
+# 但机子标签上的 SN 是 12 字符 H3CT0005EBF0，尾部 68CU 属于厂商附加字段，
+# 不是 SN 的一部分，本工具不解析也不生成。
+DEVICE_SN_SLOT_SIZE = 0x10
+# 实际 SN 长度上限 = 12，与标签以及 0x14105f 处的副本一致。
 DEVICE_SN_SIZE = 0x0C
+# 副本槽同样是 12 字符短 SN，其后紧跟明文 ctromfile_GUI.cfg，两处上限必须一致。
+DEVICE_SN_DUP_SIZE = DEVICE_SN_SIZE
 ALMAC_REGION_OFFSET = 0x80000
 ALMAC_REGION_SIZE = 0x4000
 CALIBRATION_OFFSET = 0x1C0400
@@ -74,6 +81,72 @@ C_PON_DOWNLINK_FLAGS_OFFSET = 0x2400
 
 # MAC 派生偏移 (末字节)
 OFF_ETH0, OFF_PON0, OFF_WIFI_5G, OFF_WIFI_24G = 1, 2, 4, 5
+
+# ===================== HL202-DU（从机，mtd12）=====================
+#
+# 从机的 reservearea 挂在 mtd12（不是主机的 mtd14），大小同为 0x240000，
+# magic 也一样是 21 43 34 12，但内容结构不同：
+#
+#   0x04c000  Wi-Fi EEPROM, 0x1000      (MT7916D，与主机同偏移同长度)
+#   0x080000  gzip(ctromfile.cfg)       (label MAC 在 AL-MAC="..." 内)
+#   0x100000  syslog                     (可丢弃)
+#   0x140000  GUD 字段索引表
+#   0x141010  GUD 出厂字符串, 151 字节   (SN / SSID / 密码 / 日期)
+#   0x1c0400  PON BOB 校准, 0xE1 (225)  (EN7571，长度逐台实测)
+#
+# 与主机最关键的差异：**没有下行 PON 校准**（整分区无 UX3326/OBosaMode 等），
+# 所以从机不需要 mtd13。
+HL_FACTORY_SIZE = 0x240000
+HL_MAGIC_OFFSET = 0x140000
+HL_MAGIC = bytes([0x21, 0x43, 0x34, 0x12])
+HL_GUD_OFFSET = 0x141010
+HL_GUD_SIZE = 151
+HL_SN_OFFSET = 0x14102C
+HL_SN_DUP_OFFSET = 0x14105F
+HL_SN_SIZE = 0x0C
+HL_ALMAC_OFFSET = 0x80000
+HL_ALMAC_SIZE = 0x4000
+HL_EEPROM_OFFSET = 0x4C000
+HL_EEPROM_SIZE = 0x1000
+HL_BOB_OFFSET = 0x1C0400
+HL_BOB_SIZE = 0xE1
+
+# 从机专属 512 KiB 紧凑布局，magic 与主机不同，两套互不通用。
+# 有效数据只到 0x20E1（EEPROM 4 KiB + BOB 225 B），512 KiB 已有 8 倍余量。
+HL_COMPACT_SIZE = 0x80000
+HL_COMPACT_MAGIC = b"HL2-512K"
+# 旧版 1 MiB 镜像的 magic，仅用于读取兼容（偏移与本版一致，仍可解析）。
+HL_COMPACT_MAGIC_LEGACY = b"HL2-1MiB"
+HL_C_LABEL_MAC_OFFSET = 0x0010
+HL_C_SN_OFFSET = 0x0020
+# 派生 MAC 四连，偏移与主机一致（末字节 +1/+2/+4/+5）。
+# 旧版镜像这里是全 0xFF，读取时忽略、显示时现算。
+HL_C_ETH0_MAC_OFFSET = 0x0030
+HL_C_PON0_MAC_OFFSET = 0x0040
+HL_C_WIFI5G_MAC_OFFSET = 0x0050
+HL_C_WIFI24_MAC_OFFSET = 0x0060
+HL_C_EEPROM_OFFSET = 0x1000
+HL_C_BOB_OFFSET = 0x2000
+
+# GUD 字符串区字段边界（实测）。注意 ctromfile_GUD.cfg 是 17 字符而非 16，
+# 所以它之后的字段比常见资料写的偏移多 1 字节。
+HL_GUD_FIELDS = [
+    ("GUDID",     0x141010, 28),
+    ("SN",        0x14102C, 12),
+    ("reserved",  0x141038, 2),
+    ("SSID24",    0x14103A, 7),
+    ("PW24",      0x141041, 8),
+    ("SSID5G",    0x141049, 10),
+    ("PW5G",      0x141053, 8),
+    ("HW",        0x14105B, 4),
+    ("SNdup",     0x14105F, 12),
+    ("cfgname",   0x14106B, 17),
+    ("PWdup",     0x14107C, 8),
+    ("key",       0x141084, 12),
+    ("PONPW",     0x141090, 10),
+    ("flag",      0x14109A, 3),
+    ("date",      0x14109D, 10),
+]
 
 
 def parse_mac(s):
@@ -278,9 +351,12 @@ def encode(sn, label_mac, calibration=None, eeprom=None, downlink=None, downlink
     img = bytearray(b"\xff" * DEMO_SIZE)
     img[MAGIC_OFFSET:MAGIC_OFFSET + 4] = MAGIC
     img[BASE_MAC_OFFSET:BASE_MAC_OFFSET + 6] = label_mac
+    # 只写标签上的 12 字符 SN；0x14102c 槽位尾部 4 字节是厂商字段，留 0xFF。
     snb = sn.encode("ascii")[:DEVICE_SN_SIZE]
     img[DEVICE_SN_OFFSET:DEVICE_SN_OFFSET + len(snb)] = snb
-    img[DEVICE_SN_DUP_OFFSET:DEVICE_SN_DUP_OFFSET + len(snb)] = snb
+    # 副本槽同为 12 字符，其后是明文 ctromfile_GUI.cfg，绝不能多写。
+    dnb = sn.encode("ascii")[:DEVICE_SN_DUP_SIZE]
+    img[DEVICE_SN_DUP_OFFSET:DEVICE_SN_DUP_OFFSET + len(dnb)] = dnb
     block = (
         '<ctromfile>\n  <mapcfg AL-MAC="%s" />\n'
         '  <sysinfo SerialNumber="%s" />\n</ctromfile>\n'
@@ -417,6 +493,108 @@ def parse_compact(data):
     return sn, label, cal, eep, dn, dnf
 
 
+# ===================== HL202-DU（从机）解析 / 打包 =====================
+
+def looks_like_hl202_volume(data):
+    """判断一个 2.25 MB dump 是不是 HL202-DU 的 mtd12。
+
+    不能只看 magic —— 主机 mtd14 也是 21 43 34 12 @0x140000、SN 也在 0x14102c。
+    可靠判据是 GUD 区里的"配置名"：主机是 ctromfile_GUI.cfg，从机是
+    ctromfile_GUD.cfg。兜底再看上行校准区有没有明文 ECONET（主机有，从机没有）。
+    """
+    if len(data) < HL_MAGIC_OFFSET + 4:
+        return False
+    if data[HL_MAGIC_OFFSET:HL_MAGIC_OFFSET + 4] != HL_MAGIC:
+        return False
+    gud = data[HL_GUD_OFFSET:HL_GUD_OFFSET + 0x100]
+    # 注意 _find_subseq 未命中返回 -1（不是 None），必须用 >= 0 判断。
+    if _find_subseq(gud, b"ctromfile_GUD.cfg") >= 0:
+        return True
+    if _find_subseq(gud, b"ctromfile_GUI.cfg") >= 0:
+        return False
+    return data[HL_BOB_OFFSET + 0x14:HL_BOB_OFFSET + 0x1A] != b"ECONET"
+
+
+def _hl_read_sn(data):
+    if len(data) < HL_SN_OFFSET + HL_SN_SIZE:
+        return ""
+    return data[HL_SN_OFFSET:HL_SN_OFFSET + HL_SN_SIZE].decode(
+        "utf-8", "ignore"
+    ).strip("\x00 ").strip()
+
+
+def parse_hl202_volume(data):
+    """解析 HL202-DU 的 mtd12，返回 (sn, label_mac, bob, eeprom)。"""
+    sn = _hl_read_sn(data)
+    alm = read_almac_bytes(data)
+    if not sn and alm:
+        found = _find_serial_number(alm)
+        if found:
+            sn = found
+    label = None
+    if alm:
+        label = _find_al_mac(alm)
+    if not label:
+        label = read_label_mac(data)
+    bob = data[HL_BOB_OFFSET:HL_BOB_OFFSET + HL_BOB_SIZE]
+    eep = data[HL_EEPROM_OFFSET:HL_EEPROM_OFFSET + HL_EEPROM_SIZE]
+    return sn, label, bob, eep
+
+
+def is_hl202_compact(data):
+    """一段数据是不是从机的紧凑镜像（新版 512 KiB 或旧版 1 MiB）。"""
+    return data[:8] in (HL_COMPACT_MAGIC, HL_COMPACT_MAGIC_LEGACY)
+
+
+def derive_macs(label_mac):
+    """四个派生接口 MAC：(eth0, pon0, 5G, 2.4G)，末字节分别 +1/+2/+4/+5。"""
+    return tuple(derive_mac(label_mac, off) for off in (OFF_ETH0, OFF_PON0, OFF_WIFI_5G, OFF_WIFI_24G))
+
+
+def encode_hl202_512k(sn, label_mac, bob=None, eeprom=None):
+    """生成从机专属 512 KiB 紧凑镜像（magic `HL2-512K`，与主机不通用）。"""
+    img = bytearray(b"\xff" * HL_COMPACT_SIZE)
+    img[0:len(HL_COMPACT_MAGIC)] = HL_COMPACT_MAGIC
+    for off, mac in zip(
+        (HL_C_LABEL_MAC_OFFSET, HL_C_ETH0_MAC_OFFSET, HL_C_PON0_MAC_OFFSET,
+         HL_C_WIFI5G_MAC_OFFSET, HL_C_WIFI24_MAC_OFFSET),
+        (label_mac, *derive_macs(label_mac)),
+    ):
+        img[off:off + 6] = mac
+    snb = sn.encode("ascii")[:HL_SN_SIZE]
+    img[HL_C_SN_OFFSET:HL_C_SN_OFFSET + len(snb)] = snb
+    if eeprom:
+        n = min(len(eeprom), HL_EEPROM_SIZE)
+        img[HL_C_EEPROM_OFFSET:HL_C_EEPROM_OFFSET + n] = eeprom[:n]
+    if bob:
+        n = min(len(bob), HL_BOB_SIZE)
+        img[HL_C_BOB_OFFSET:HL_C_BOB_OFFSET + n] = bob[:n]
+    return bytes(img)
+
+
+def parse_hl202_compact(data):
+    """解析 HL2-512K / 旧版 HL2-1MiB 紧凑镜像，返回 (sn, label_mac, bob, eeprom)。"""
+    label = data[HL_C_LABEL_MAC_OFFSET:HL_C_LABEL_MAC_OFFSET + 6]
+    label = bytes(label) if any(b != 0xFF for b in label) else None
+    sn = ""
+    if len(data) >= HL_C_SN_OFFSET + HL_SN_SIZE:
+        sn = data[HL_C_SN_OFFSET:HL_C_SN_OFFSET + HL_SN_SIZE].decode(
+            "utf-8", "ignore"
+        ).strip("\x00 ").strip()
+    bob = data[HL_C_BOB_OFFSET:HL_C_BOB_OFFSET + HL_BOB_SIZE]
+    eep = data[HL_C_EEPROM_OFFSET:HL_C_EEPROM_OFFSET + HL_EEPROM_SIZE]
+    return sn, label, bob, eep
+
+
+def read_hl_gud(data):
+    """读出 GUD 字符串区所有字段（只读展示，不参与导出）。"""
+    out = []
+    for name, off, ln in HL_GUD_FIELDS:
+        raw = data[off:off + ln]
+        out.append((name, raw.decode("utf-8", "ignore").strip("\x00 ").strip()))
+    return out
+
+
 def parse_volume(data):
     # mtd13：下行 PON 校准的真实来源，直接走 UBIFS 解析
     if looks_like_mtd13(data):
@@ -479,6 +657,12 @@ def main():
 
     p = sub.add_parser("parse", help="解析真实 reservearea 备份或 mtd13")
     p.add_argument("--bin", required=True)
+
+    h = sub.add_parser("hl202", help="HL202-DU（从机）: 解析 mtd12 / 生成 512 KiB")
+    h.add_argument("--bin", help="mtd12 reservearea 备份 (.bin)，给定时解析")
+    h.add_argument("--sn", help="生成用 SN（12 字符），省略则沿用 --bin 里的")
+    h.add_argument("--mac", help="生成用 label MAC，省略则沿用 --bin 里的")
+    h.add_argument("-o", "--out", help="输出 512 KiB 镜像路径")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -558,6 +742,55 @@ def main():
                 "  BOSA 标志: OBosaMode=%(OBosaMode)s BosaFlag=%(BosaFlag)s "
                 "TempFlag=%(TempFlag)s" % dnf
             )
+    elif args.cmd == "hl202":
+        sn, label, bob, eep = "", None, None, None
+        if args.bin:
+            data = open(args.bin, "rb").read()
+            if is_hl202_compact(data):
+                sn, label, bob, eep = parse_hl202_compact(data)
+                print("文件: %s (%d 字节) · HL2-512K 紧凑镜像" % (args.bin, len(data)))
+            else:
+                if not looks_like_hl202_volume(data):
+                    print("警告: %s 不像 HL202-DU 的 mtd12（magic/GUD 配置名不匹配）"
+                          % args.bin)
+                sn, label, bob, eep = parse_hl202_volume(data)
+                print("文件: %s (%d 字节) · mtd12 reservearea"
+                      % (args.bin, len(data)))
+                print("  GUD 字符串:")
+                for k, v in read_hl_gud(data):
+                    if v:
+                        print("    %-10s %s" % (k, v))
+            print("  Device SN : %r" % sn)
+            print("  Label MAC : %s"
+                  % (mac_to_string(label) if label else "<未找到>"))
+            if label:
+                e0, p0, w5, w24 = derive_macs(label)
+                print("  eth0  (+1): %s" % mac_to_string(e0))
+                print("  pon0  (+2): %s" % mac_to_string(p0))
+                print("  5G    (+4): %s" % mac_to_string(w5))
+                print("  2.4G  (+5): %s" % mac_to_string(w24))
+            print("  PON BOB   : %d 字节 (EN7571, 非FF=%d)"
+                  % (len(bob), sum(1 for b in bob if b != 0xFF)))
+            print("  EEPROM    : %d 字节" % len(eep))
+            print("  下行 PON  : 本机型无此分区")
+        if args.sn is not None:
+            if len(args.sn) != HL_SN_SIZE:
+                print("警告: SN 长度 %d != %d, 将被截断" % (len(args.sn), HL_SN_SIZE))
+            sn = args.sn
+        if args.mac is not None:
+            m = parse_mac(args.mac)
+            if not m:
+                sys.exit("MAC 无效: %s" % args.mac)
+            label = m
+        if args.out:
+            if not sn or not label:
+                sys.exit("生成 512 KiB 需要 SN 和 MAC（用 --bin 或 --sn/--mac 提供）")
+            img = encode_hl202_512k(sn, label, bob, eep)
+            open(args.out, "wb").write(img)
+            print("已写出 %d 字节 -> %s" % (len(img), args.out))
+            print("  magic     : %r" % img[:8])
+            print("  SN        : %s" % sn)
+            print("  Label MAC : %s" % mac_to_string(label))
     else:
         ap.print_help()
 

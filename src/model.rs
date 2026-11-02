@@ -80,7 +80,18 @@ pub const BASE_MAC_SIZE: usize = 6;
 
 pub const DEVICE_SN_OFFSET: usize = 0x14102c;
 pub const DEVICE_SN_DUP_OFFSET: usize = 0x14105f;
+/// 槽位（field）在镜像里的物理长度：原厂 `mtd14` 在 `0x14102c` 放了 16 个 ASCII
+/// 字节 `H3CT0005EBF068CU`。但机子标签上的 SN 是 **12 字符** `H3CT0005EBF0`，
+/// 尾部 `68CU` 属于厂商附加字段，**不是 SN 的一部分**，因此我们不写它。
+///
+/// 之所以单独留出这个常量，是为了让「槽位有多宽」和「SN 有多长」两件事在代码里
+/// 分明：读、写都只用前 [`DEVICE_SN_SIZE`] 字节，尾部 4 字节保持原样。
+pub const DEVICE_SN_SLOT_SIZE: usize = 0x10;
+/// 实际 SN 长度上限 = 12，与标签以及 `0x14105f` 处的副本一致。
 pub const DEVICE_SN_SIZE: usize = 0x0c;
+/// 副本槽（`0x14105f`）同样是 12 字符短 SN，其后紧跟明文 `ctromfile_GUI.cfg`，
+/// 所以两处写入的上限必须一致，都是 12。
+pub const DEVICE_SN_DUP_SIZE: usize = DEVICE_SN_SIZE;
 
 pub const ALMAC_REGION_OFFSET: usize = 0x80000;
 pub const ALMAC_REGION_SIZE: usize = 0x4000;
@@ -120,7 +131,7 @@ pub const C_ETH0_MAC_OFFSET: usize = 0x0020; // label+1
 pub const C_PON0_MAC_OFFSET: usize = 0x0030; // label+2 (pon0/wan)
 pub const C_WIFI5G_MAC_OFFSET: usize = 0x0040; // label+4
 pub const C_WIFI24_MAC_OFFSET: usize = 0x0050; // label+5
-pub const C_DEVICE_SN_OFFSET: usize = 0x0060; // 12-byte ASCII
+pub const C_DEVICE_SN_OFFSET: usize = 0x0060; // 12-byte ASCII（标签上的 SN）
 pub const C_WIFI_EEPROM_OFFSET: usize = 0x1000; // 0x1000, MT7916
 pub const C_CALIBRATION_OFFSET: usize = 0x2000; // 0x200, EN7572 上行 PON
 pub const C_PON_DOWNLINK_CAL_OFFSET: usize = 0x2200; // 0x120, UX3326 下行 PON
@@ -209,11 +220,19 @@ impl Factory {
         img[MAGIC_OFFSET..MAGIC_OFFSET + 4].copy_from_slice(&MAGIC);
         img[BASE_MAC_OFFSET..BASE_MAC_OFFSET + 6].copy_from_slice(&self.label_mac);
 
+        // 只写标签上的 12 字符 SN。`0x14102c` 的槽位实际有 16 字节宽，尾部
+        // `68CU` 是厂商附加字段（见 DEVICE_SN_SLOT_SIZE），本工具不解析也不
+        // 生成它 —— 生成的 demo 镜像该位置留 0xFF。真正的 mtd14 应由用户自行
+        // 按字节 patch，而不是用本 demo 镜像整片覆盖。
         let sn = self.device_sn.as_bytes();
         let n = sn.len().min(DEVICE_SN_SIZE);
         if n > 0 {
             img[DEVICE_SN_OFFSET..DEVICE_SN_OFFSET + n].copy_from_slice(&sn[..n]);
-            img[DEVICE_SN_DUP_OFFSET..DEVICE_SN_DUP_OFFSET + n].copy_from_slice(&sn[..n]);
+        }
+        // 副本槽同为 12 字符，其后紧跟明文 `ctromfile_GUI.cfg`，绝不能多写。
+        let dn = sn.len().min(DEVICE_SN_DUP_SIZE);
+        if dn > 0 {
+            img[DEVICE_SN_DUP_OFFSET..DEVICE_SN_DUP_OFFSET + dn].copy_from_slice(&sn[..dn]);
         }
 
         // AL-MAC region: plain-text ctromfile block for easy viewing/comparison.
@@ -499,10 +518,16 @@ pub fn random_mac() -> [u8; 6] {
     m
 }
 
-/// `H3CT` + 8 random uppercase hex = 12 chars, exactly matching DEVICE_SN_SIZE
-/// and the real device serial format (`H3CT0005EBF0`).
+/// `H3CT` + 8 random uppercase hex = 12 chars, matching `DEVICE_SN_SIZE` and the
+/// 12-character serial printed on the device label (`H3CT0005EBF0`). The 4 extra
+/// bytes seen at `0x14102c` on a real `mtd14` (`68CU`) are a vendor suffix and are
+/// deliberately left untouched by `encode()`.
 pub fn random_sn() -> String {
     let mut b = [0u8; 4];
     let _ = getrandom::fill(&mut b);
-    format!("H3CT{:08X}", u32::from_be_bytes(b))
+    let mut s = String::from("H3CT");
+    for byte in b {
+        s.push_str(&format!("{byte:02X}"));
+    }
+    s
 }

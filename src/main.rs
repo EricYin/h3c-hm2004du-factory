@@ -13,10 +13,14 @@
 //! Run:   `cargo run --release`
 
 mod font;
+mod hl202;
 mod import;
 mod model;
 
 use eframe::egui;
+use hl202::{
+    parse_compact as hl_parse_compact, Hl202, HL_BOB_SIZE, HL_EEPROM_SIZE, HL_PON_CHIP, HL_SN_SIZE,
+};
 use model::{
     detect_downlink_chip, detect_pon_chip, derive_mac, mac_to_string, parse_mac, random_mac,
     random_sn, Factory, PON_DOWNLINK_CAL_SIZE, CALIBRATION_SIZE, OFF_ETH0, OFF_PON0,
@@ -25,8 +29,20 @@ use model::{
 use rfd::FileDialog;
 use std::path::Path;
 
+/// 当前编辑的机型。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// H3C HM2004-DU（主机）：mtd14 出厂区 + mtd13 下行校准。
+    Hm2004,
+    /// H3C HL202-DU（从机）：只有 mtd12（reservearea），无下行校准。
+    Hl202,
+}
+
 struct Editor {
+    kind: Kind,
     factory: Factory,
+    /// 从机数据。切到 HL202 机型时使用，与 `factory` 互不影响。
+    hl202: Hl202,
     device_sn: String,
     label_mac: String,
     msg: String,
@@ -34,6 +50,8 @@ struct Editor {
     src_factory: Option<String>,
     /// 已载入的下行 PON 分区（mtd13）文件名。
     src_downlink: Option<String>,
+    /// 从机 GUD 字符串（只读展示，不参与导出）。
+    gud: Vec<(&'static str, String)>,
 }
 
 impl Editor {
@@ -47,6 +65,18 @@ impl Editor {
             self.factory.label_mac = m;
         }
         self.factory.device_sn = self.device_sn.clone();
+    }
+
+    fn sync_from_hl202(&mut self) {
+        self.device_sn = self.hl202.device_sn.clone();
+        self.label_mac = mac_to_string(&self.hl202.label_mac);
+    }
+
+    fn apply_to_hl202(&mut self) {
+        if let Some(m) = parse_mac(&self.label_mac) {
+            self.hl202.label_mac = m;
+        }
+        self.hl202.device_sn = self.device_sn.clone();
     }
 
     fn save_image(&mut self, img: Vec<u8>, default_name: &str) {
@@ -100,10 +130,38 @@ impl Editor {
         }
     }
 
+    /// Load the **from-unit** reservearea partition (HL202-DU mtd12).
+    ///
+    /// 从机与主机共用 magic 与 2.25 MB 尺寸，靠 `looks_like_hl202_volume`
+    /// 里 GUD 配置名（`ctromfile_GUD.cfg` vs `ctromfile_GUI.cfg`）区分。
+    fn open_hl202(&mut self, bytes: &[u8], name: &str) {
+        let compact = hl202::is_compact(bytes);
+        self.hl202 = if compact {
+            hl_parse_compact(bytes)
+        } else {
+            hl202::parse_hl202_volume(bytes)
+        };
+        self.kind = Kind::Hl202;
+        self.sync_from_hl202();
+        self.src_factory = Some(name.to_string());
+        self.src_downlink = None;
+        self.gud = if compact {
+            Vec::new()
+        } else {
+            hl202::read_gud_strings(bytes)
+        };
+        self.msg = format!(
+            "已打开从机 HL202-DU ({}): {name}",
+            if compact { "HL2-512K 紧凑镜像" } else { "mtd12 reservearea" }
+        );
+    }
+
     /// Dispatch on content so the user can pick either file in the same dialog.
     fn open_auto(&mut self, bytes: &[u8], name: &str) {
         if import::looks_like_mtd13(bytes) {
             self.open_downlink(bytes, name);
+        } else if hl202::is_compact(bytes) || hl202::looks_like_hl202_volume(bytes) {
+            self.open_hl202(bytes, name);
         } else {
             self.open_factory(bytes, name);
         }
@@ -134,19 +192,62 @@ impl eframe::App for Editor {
         //    `Arc<Style>`，只改 ctx 对本帧无效（要等下一帧）。钉一下，首帧就不闪。
         ui.set_style(apply_light_theme(ui.ctx()));
 
-        // ---- 顶栏：标题 + 动作 ----
+        // ---- 顶栏：标题 + 机型切换 + 动作 ----
         ui.horizontal(|ui| {
             ui.heading("H3C Factory");
+            ui.separator();
+            // 机型切换。两套布局互不相通（magic 不同），切换只是换面板，
+            // 已载入的数据各自保留在 factory / hl202 里，不会互相覆盖。
+            if ui
+                .selectable_label(self.kind == Kind::Hm2004, "主机 HM2004-DU")
+                .clicked()
+                && self.kind != Kind::Hm2004
+            {
+                self.kind = Kind::Hm2004;
+                self.src_factory = None;
+                self.src_downlink = None;
+                self.gud.clear();
+                self.sync_from_factory();
+                self.msg = "已切换到主机 HM2004-DU".into();
+            }
+            if ui
+                .selectable_label(self.kind == Kind::Hl202, "从机 HL202-DU")
+                .clicked()
+                && self.kind != Kind::Hl202
+            {
+                self.kind = Kind::Hl202;
+                self.src_factory = None;
+                self.src_downlink = None;
+                self.gud.clear();
+                self.sync_from_hl202();
+                self.msg = "已切换到从机 HL202-DU".into();
+            }
+        });
+        // 标题 + 机型切换 + 8 个动作按钮挤在同一行，在 720 px 宽下会溢出 ——
+        // `horizontal` 不换行，右对齐的按钮组会被推出可视区、整组看不见。
+        // 拆成两行：第一行标题与机型，第二行动作按钮（右对齐）。
+        ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("保存 1 MiB").clicked() {
-                    self.apply_to_factory();
-                    let img = self.factory.encode_1mib();
-                    self.save_image(img, "factory-h3c-1mib.bin");
-                }
-                if ui.button("保存真实布局").clicked() {
-                    self.apply_to_factory();
-                    let img = self.factory.encode();
-                    self.save_image(img, "factory-h3c-layout.bin");
+                match self.kind {
+                    Kind::Hm2004 => {
+                        if ui.button("保存 1 MiB").clicked() {
+                            self.apply_to_factory();
+                            let img = self.factory.encode_1mib();
+                            self.save_image(img, "factory-h3c-1mib.bin");
+                        }
+                        if ui.button("保存真实布局").clicked() {
+                            self.apply_to_factory();
+                            let img = self.factory.encode();
+                            self.save_image(img, "factory-h3c-layout.bin");
+                        }
+                    }
+                    Kind::Hl202 => {
+                        if ui.button("保存 512 KiB").clicked() {
+                            self.apply_to_hl202();
+                            let img = self.hl202.encode_compact();
+                            self.save_image(img, "factory-hl202-512k.bin");
+                        }
+                    }
                 }
                 if ui.button("打开…").clicked() {
                     if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
@@ -159,42 +260,85 @@ impl eframe::App for Editor {
                         }
                     }
                 }
-                // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
-                // 互不覆盖（见 open_factory / open_downlink）。
-                if ui.button("打开出厂区 (mtd14)").clicked() {
-                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
-                        match std::fs::read(&p) {
-                            Ok(b) => {
-                                let name = p.display().to_string();
-                                self.open_factory(&b, &name);
+                match self.kind {
+                    Kind::Hm2004 => {
+                        // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
+                        // 互不覆盖（见 open_factory / open_downlink）。
+                        if ui.button("打开出厂区 (mtd14)").clicked() {
+                            if let Some(p) =
+                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_factory(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
                             }
-                            Err(e) => self.msg = format!("读取失败: {e}"),
+                        }
+                        if ui.button("打开下行校准 (mtd13)").clicked() {
+                            if let Some(p) =
+                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_downlink(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
                         }
                     }
-                }
-                if ui.button("打开下行校准 (mtd13)").clicked() {
-                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
-                        match std::fs::read(&p) {
-                            Ok(b) => {
-                                let name = p.display().to_string();
-                                self.open_downlink(&b, &name);
+                    Kind::Hl202 => {
+                        if ui.button("打开 mtd12").clicked() {
+                            if let Some(p) =
+                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_hl202(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
                             }
-                            Err(e) => self.msg = format!("读取失败: {e}"),
                         }
                     }
                 }
                 if ui.button("新建").clicked() {
-                    self.factory = Factory::new();
-                    self.sync_from_factory();
+                    match self.kind {
+                        Kind::Hm2004 => {
+                            self.factory = Factory::new();
+                            self.sync_from_factory();
+                            self.msg = "新建 HM2004-DU Factory".into();
+                        }
+                        Kind::Hl202 => {
+                            self.hl202 = Hl202::new();
+                            self.sync_from_hl202();
+                            self.msg = "新建 HL202-DU Factory".into();
+                        }
+                    }
                     self.src_factory = None;
                     self.src_downlink = None;
-                    self.msg = "新建 Factory".into();
+                    self.gud.clear();
                 }
             });
         });
         ui.label(&self.msg);
         ui.separator();
 
+        match self.kind {
+            Kind::Hm2004 => self.ui_hm2004(ui),
+            Kind::Hl202 => self.ui_hl202(ui),
+        }
+    }
+}
+
+impl Editor {
+    /// 主机 HM2004-DU 面板：身份 + 派生 MAC + 上行/下行校准 + EEPROM。
+    fn ui_hm2004(&mut self, ui: &mut egui::Ui) {
         // 已载入来源：让用户一眼看出两个分区是否都到位
         egui::Grid::new("sources")
             .num_columns(2)
@@ -222,9 +366,7 @@ impl eframe::App for Editor {
         const FIELD: f32 = 280.0;
         ui.horizontal(|ui| {
             ui.label("标签 MAC");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.label_mac).desired_width(FIELD),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.label_mac).desired_width(FIELD));
             if ui.button("随机").clicked() {
                 self.factory.label_mac = random_mac();
                 self.label_mac = mac_to_string(&self.factory.label_mac);
@@ -232,9 +374,7 @@ impl eframe::App for Editor {
         });
         ui.horizontal(|ui| {
             ui.label("设备序列号");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.device_sn).desired_width(FIELD),
-            );
+            ui.add(egui::TextEdit::singleline(&mut self.device_sn).desired_width(FIELD));
             if ui.button("随机").clicked() {
                 self.factory.device_sn = random_sn();
                 self.device_sn = self.factory.device_sn.clone();
@@ -242,25 +382,8 @@ impl eframe::App for Editor {
         });
 
         ui.add_space(6.0);
-        ui.label("派生 MAC（末字节偏移，随标签 MAC 实时计算）");
         let base = parse_mac(&self.label_mac).unwrap_or(self.factory.label_mac);
-        egui::Grid::new("derived_macs")
-            .num_columns(2)
-            .spacing([16.0, 3.0])
-            .show(ui, |ui| {
-                ui.label("eth0  (+1)");
-                ui.monospace(mac_to_string(&derive_mac(&base, OFF_ETH0)));
-                ui.end_row();
-                ui.label("pon0  (+2)");
-                ui.monospace(mac_to_string(&derive_mac(&base, OFF_PON0)));
-                ui.end_row();
-                ui.label("5G    (+4)");
-                ui.monospace(mac_to_string(&derive_mac(&base, OFF_WIFI_5G)));
-                ui.end_row();
-                ui.label("2.4G  (+5)");
-                ui.monospace(mac_to_string(&derive_mac(&base, OFF_WIFI_24G)));
-                ui.end_row();
-            });
+        derived_mac_grid(ui, &base, "derived_macs");
 
         // ---- 数据区 ----
         ui.add_space(8.0);
@@ -319,6 +442,118 @@ impl eframe::App for Editor {
         ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · 上行校准@0x1c0400 · 下行校准@0x1c1000 · EEPROM@0x4c000");
         ui.weak("下行 PON 校准原始来源为 mtd13 的 UBIFS 卷 ubifs1（/bosa/mmodified_UX3326.bin，288 字节，取 sqnum 最新副本）。");
     }
+
+    /// 从机 HL202-DU 面板：身份 + BOB + EEPROM + GUD 只读。
+    ///
+    /// 从机没有下行 PON 校准分区，所以这里**不出现下行那一栏** —— 免得用户以为
+    /// 漏载了文件。
+    fn ui_hl202(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("hl_sources")
+            .num_columns(2)
+            .spacing([16.0, 2.0])
+            .show(ui, |ui| {
+                ui.weak("reservearea (mtd12)");
+                ui.monospace(self.src_factory.as_deref().unwrap_or("<未载入>"));
+                ui.end_row();
+                ui.weak("下行校准");
+                ui.weak("本机型无此分区");
+                ui.end_row();
+            });
+        ui.separator();
+
+        egui::CollapsingHeader::new("当前镜像摘要")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.monospace(self.hl202.summary());
+            });
+        ui.separator();
+
+        ui.heading("身份信息");
+        const FIELD: f32 = 280.0;
+        ui.horizontal(|ui| {
+            ui.label("标签 MAC");
+            ui.add(egui::TextEdit::singleline(&mut self.label_mac).desired_width(FIELD));
+            if ui.button("随机").clicked() {
+                self.hl202.label_mac = random_mac();
+                self.label_mac = mac_to_string(&self.hl202.label_mac);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!("设备序列号（{} 字符）", HL_SN_SIZE));
+            ui.add(egui::TextEdit::singleline(&mut self.device_sn).desired_width(FIELD));
+            if ui.button("随机").clicked() {
+                self.hl202.device_sn = random_sn();
+                self.device_sn = self.hl202.device_sn.clone();
+            }
+        });
+
+        ui.add_space(6.0);
+        let base = parse_mac(&self.label_mac).unwrap_or(self.hl202.label_mac);
+        derived_mac_grid(ui, &base, "hl_derived_macs");
+
+        ui.add_space(8.0);
+        blob_section(
+            ui,
+            &format!("PON BOB 校准 ({HL_PON_CHIP})"),
+            &mut self.hl202.bob,
+            HL_BOB_SIZE,
+            &mut self.msg,
+        );
+        blob_section(
+            ui,
+            "Wi-Fi EEPROM (MT7916D)",
+            &mut self.hl202.wifi_eeprom,
+            HL_EEPROM_SIZE,
+            &mut self.msg,
+        );
+
+        if !self.gud.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("GUD 出厂字符串（只读，不写入 512 KiB）")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("gud_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 2.0])
+                        .show(ui, |ui| {
+                            for (k, v) in &self.gud {
+                                ui.weak(*k);
+                                ui.monospace(v.as_str());
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+
+        ui.add_space(8.0);
+        ui.weak("从机 reservearea 在 mtd12（2.25 MB），没有下行 PON 校准分区，也不需要 mtd13。");
+        ui.weak("512 KiB 镜像用专属 magic `HL2-512K`，与主机的 `H3C-1MiB` 不通用。");
+        ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · BOB@0x1c0400 (0xE1) · EEPROM@0x4c000");
+        ui.weak("GUD 字符串里只搬运 SN 和 MAC；SSID/密码/生产日期等留在原分区，不写入 512 KiB。");
+    }
+}
+
+/// 派生 MAC 只读表。两台机型规则相同（末字节 +1/+2/+4/+5），故共用一份绘制逻辑；
+/// `grid_id` 用来区分两套面板里的 Grid，避免 egui 记忆错位。
+fn derived_mac_grid(ui: &mut egui::Ui, base: &[u8; 6], grid_id: &str) {
+    ui.label("派生 MAC（末字节偏移，随标签 MAC 实时计算）");
+    egui::Grid::new(grid_id)
+        .num_columns(2)
+        .spacing([16.0, 3.0])
+        .show(ui, |ui| {
+            ui.label("eth0  (+1)");
+            ui.monospace(mac_to_string(&derive_mac(base, OFF_ETH0)));
+            ui.end_row();
+            ui.label("pon0  (+2)");
+            ui.monospace(mac_to_string(&derive_mac(base, OFF_PON0)));
+            ui.end_row();
+            ui.label("5G    (+4)");
+            ui.monospace(mac_to_string(&derive_mac(base, OFF_WIFI_5G)));
+            ui.end_row();
+            ui.label("2.4G  (+5)");
+            ui.monospace(mac_to_string(&derive_mac(base, OFF_WIFI_24G)));
+            ui.end_row();
+        });
 }
 
 /// One framed blob row, styled like the upstream editor: bold title, a
@@ -379,11 +614,14 @@ fn blob_section(
 
 /// 构造本应用的亮色 [`egui::Style`]（只构造一次，之后每次只是 Arc 克隆）。
 ///
-/// 在 `egui::Visuals::light()` 基础上改三处：
+/// 在 `egui::Visuals::light()` 基础上改四处：
 /// - `weak_text_color`：默认由 `text_color * weak_text_alpha(0.6)` 派生，白底上
 ///   发灰、几乎不可读，钉成 110。
 /// - 三态按钮底色 230 / 220 / 165 太接近，一眼分不出，拉开成 238 / 205 / 170。
 /// - `panel_fill` / `window_fill` 钉成纯白。
+/// - `inactive.bg_stroke`：`Widgets::light()` 里它是 `Stroke::NONE`，而 `TextEdit`
+///   不聚焦时正是用它画边框 —— 纯白面板上的输入框会**完全没有边界**，只剩一片白。
+///   补一条 gray(190) 描边，与 `Frame::group` 的边框同色，白底上才看得出输入区。
 fn light_style() -> std::sync::Arc<egui::Style> {
     static STYLE: std::sync::OnceLock<std::sync::Arc<egui::Style>> = std::sync::OnceLock::new();
     STYLE
@@ -392,6 +630,8 @@ fn light_style() -> std::sync::Arc<egui::Style> {
             v.weak_text_color = Some(egui::Color32::from_gray(110));
             v.widgets.inactive.bg_fill = egui::Color32::from_gray(238);
             v.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(238);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, egui::Color32::from_gray(190));
             v.widgets.hovered.bg_fill = egui::Color32::from_gray(205);
             v.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(205);
             v.widgets.active.bg_fill = egui::Color32::from_gray(170);
@@ -422,8 +662,8 @@ fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 760.0])
-            .with_min_inner_size([640.0, 560.0]),
+            .with_inner_size([760.0, 780.0])
+            .with_min_inner_size([680.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -433,12 +673,15 @@ fn main() -> eframe::Result {
             font::install(&cc.egui_ctx);
             apply_light_theme(&cc.egui_ctx);
             let mut ed = Editor {
+                kind: Kind::Hm2004,
                 factory: Factory::new(),
+                hl202: Hl202::new(),
                 device_sn: String::new(),
                 label_mac: String::new(),
                 msg: "新建 Factory".to_string(),
                 src_factory: None,
                 src_downlink: None,
+                gud: Vec::new(),
             };
             ed.sync_from_factory();
             // Like upstream: allow `h3c-hm2004du-factory.exe backup.bin`
