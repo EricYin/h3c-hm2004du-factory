@@ -9,7 +9,7 @@ Rust + egui 图形工具，用于**查看 / 编辑 / 对照** H3C FTTR 设备的
 |---|---|---|---|---|
 | **HM2004-DU** | 主网关（AN7581） | mtd14 `reservearea` + mtd13 `ubifs1` | 有（mtd13，UX3326，288 B） | 1 MiB，`H3C-1MiB` |
 | **HL202-DU** | 从机 | mtd12 `reservearea` | **无**（该机型没有此分区） | 512 KiB，`HL2-512K` |
-| **AN4475** | 10G PON ONT | mtd9（UBI 卷 `fhdata` / UBIFS） | 以 6 张 BOSA 校准表形式存在 | 1 MiB，`AN4-1MiB`（容器） |
+| **AN4475** | 10G PON ONT | mtd9（UBI 卷 `fhdata` / UBIFS） | 以 6 张 BOSA 校准表形式存在 | 2 MiB，`AN4-2MiB`（容器） |
 
 本项目是 `fiberhome-factory` 的 **H3C 改写版**：布局、导入逻辑、MAC 派生规则全部针对上述机型重新实现。
 
@@ -194,7 +194,7 @@ python3 an758x_factory_demo.py hl202 --bin mtd12.bin \
 # 解析 mtd9 备份（打印身份字段、9 个派生 MAC、21 个出厂文件）
 python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin
 
-# 直接转成 1 MiB 容器
+# 直接转成 2 MiB 容器
 python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin -o factory-an4475-1mib.bin
 
 # 换身份再生成（出厂文件仍取自备份，只改身份）
@@ -204,7 +204,7 @@ python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin \
     --gpon-pw HG26099999 --wifi-24 D4:9F:29:04:E8:06 \
     --wifi-5g D4:9F:29:04:E8:07 -o factory-an4475-1mib.bin
 
-# 也可以直接读回已生成的 1 MiB 容器
+# 也可以直接读回已生成的 2 MiB 容器
 python3 an758x_factory_demo.py an4475 --bin factory-an4475-1mib.bin
 ```
 
@@ -343,13 +343,13 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 - **GPON SN = ASCII `FHTT` + 4 字节**：真机 `46485454C26A69FF` → `FHTT` + `C2 6A 69 FF`。这 4 字节与 MAC/SN 无对应关系，只能单独填。
 - **GPON 密码是 hex 编码的 ASCII**：`48473236303132333435` → `HG26012345`。
 
-### 1 MiB 容器（`AN4-1MiB`）
+### 2 MiB 容器（`AN4-2MiB`）
 
-与 H3C 两台机型不同，这里**不能**用固定偏移摆放：单机唯一数据共 1.40 MB，其中 Wi-Fi EEPROM 一个文件就 1.32 MiB，1 MiB 装不下。因此改成自描述的容器 —— 头部固定偏移放身份（消费方不解析 TOC 也能直接读），其余文件进 TOC + zlib 载荷：
+与 H3C 两台机型不同，这里**不能**用固定偏移摆放：单机唯一数据共 1.40 MB，其中 Wi-Fi EEPROM 一个文件就 1.32 MiB，1 MiB 装不下（真实分区按 2 MiB 规划）。因此改成自描述的容器 —— 头部固定偏移放身份（消费方不解析 TOC 也能直接读），其余文件进 TOC + zlib 载荷：
 
 | 偏移 | 长度 | 内容 |
 |---|---|---|
-| `0x000000` | 8 | magic `AN4-1MiB` |
+| `0x000000` | 8 | magic `AN4-2MiB`（旧镜像 `AN4-1MiB` 仍可读） |
 | `0x000008` | 4 | 版本 = 1 |
 | `0x00000C` | 4 | 文件数 |
 | `0x000010` | 4 | TOC 偏移 = `0x1000` |
@@ -368,7 +368,9 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 | `0x001000` | 48/项 | TOC：名 32 + `off`/`raw_len`/`stored_len` 各 4 + 压缩标志 1 |
 | `0x002000` | — | 载荷（能压就压，压不动原样存） |
 
-实测载荷 **210 962 字节**（EEPROM 从 1.32 MiB 压到约 195 KiB），1 MiB 余量充足。若换用更大的 EEPROM 导致溢出，导出会直接报错并指出是哪个文件、写到哪个偏移，不会静默截断。
+实测载荷 **210 962 字节**（EEPROM 从 1.32 MiB 压到约 195 KiB），只占 2 MiB 的 10%，余量非常充足。载荷区之后到 `0x200000` 全部填 `0xFF`。若换用更大的 EEPROM 导致溢出，导出会直接报错并指出是哪个文件、写到哪个偏移，不会静默截断。
+
+**旧镜像兼容**：早先生成的 1 MiB 容器（magic `AN4-1MiB`）头部偏移与本版完全一致，工具仍能读入并显示，状态栏会标注「旧版，导出将升级为 2 MiB」；重新保存即得到 2 MiB + `AN4-2MiB`。
 
 **身份回写**：导出前会把 SN / MAC / GPON SN / 密码写回 `factory_conf` 的对应 UCI 段（只改 `option value`，其余字节与缩进原样保留），保证文本与头部一致。来回解析 21 个文件逐字节一致（已验证）。
 
@@ -390,7 +392,7 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 因此本工具把 Wi-Fi MAC 当成身份的一部分来处理：
 
 - 界面上有 `Wi-Fi 2.4G MAC` / `Wi-Fi 5G MAC` 两个框，可手填，也可点「按基准 MAC 派生」
-- 导出时**三处一起写**：1 MiB 头部 `0x96`/`0x9C`、EEPROM `+0x04`/`+0x0A`、`factory_conf` 的 `APMAC_1`/`APMAC_2`
+- 导出时**三处一起写**：容器头部 `0x96`/`0x9C`、EEPROM `+0x04`/`+0x0A`、`factory_conf` 的 `APMAC_1`/`APMAC_2`
 - EEPROM 其余 1.32 MiB（含全部校准表）逐字节原样保留，只动这 12 字节
 - 导入时若 EEPROM 的 device id 不是 `0x7993`，界面会标出来
 
@@ -413,7 +415,7 @@ an758x-factory/
 │   ├── main.rs      # egui 编辑器（机型下拉 + 三套面板）
 │   ├── model.rs     # HM2004-DU 布局常量 + Factory + encode
 │   ├── hl202.rs     # HL202-DU 布局常量 + Hl202 + encode_compact（512 KiB）
-│   ├── an4475.rs    # AN4475：mtd9 UBI/UBIFS 解析 + 1 MiB 容器
+│   ├── an4475.rs    # AN4475：mtd9 UBI/UBIFS 解析 + 2 MiB 容器
 │   └── import.rs    # 解析真实 factory 卷 / mtd13 UBIFS
 ├── an758x_factory_demo.py
 └── examples/

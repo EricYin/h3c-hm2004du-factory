@@ -38,7 +38,7 @@ enum Kind {
     Hm2004,
     /// H3C HL202-DU（从机）：只有 mtd12（reservearea），无下行校准。
     Hl202,
-    /// AN4475（10G PON）：mtd9（UBI 卷 fhdata / UBIFS）→ 1 MiB 容器。
+    /// AN4475（10G PON）：mtd9（UBI 卷 fhdata / UBIFS）→ 2 MiB 容器。
     An4475,
 }
 
@@ -253,7 +253,7 @@ impl Editor {
         );
     }
 
-    /// 载入 AN4475 的 mtd9 备份，或本工具生成的 1 MiB 容器。
+    /// 载入 AN4475 的 mtd9 备份，或本工具生成的 1/2 MiB 容器。
     ///
     /// mtd9 不是裸分区而是整个 UBI 设备（25 MiB / 200 个 PEB），里面只有一个
     /// 卷 `fhdata`，卷上是 UBIFS。解析见 `an4475::parse_mtd9`。
@@ -276,7 +276,11 @@ impl Editor {
                 self.gud.clear();
                 self.msg = format!(
                     "已打开 AN4475 ({}): {name} · {n} 个出厂文件{}",
-                    if compact { "AN4-1MiB 容器" } else { "mtd9 UBI/UBIFS" },
+                    if compact {
+                        an4475::compact_magic_name(bytes)
+                    } else {
+                        "mtd9 UBI/UBIFS"
+                    },
                     if bosa.is_empty() {
                         String::new()
                     } else {
@@ -529,12 +533,12 @@ impl eframe::App for Editor {
                 }
                 Kind::An4475 => {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("保存 1 MiB").strong()))
+                        .add(egui::Button::new(egui::RichText::new("保存 2 MiB").strong()))
                         .clicked()
                     {
                         self.apply_to_an();
                         match self.an.encode_compact() {
-                            Ok(img) => self.save_image(img, "factory-an4475-1mib.bin"),
+                            Ok(img) => self.save_image(img, "factory-an4475-2mib.bin"),
                             Err(e) => self.msg = format!("生成失败: {e}"),
                         }
                     }
@@ -758,7 +762,7 @@ impl Editor {
             .num_columns(2)
             .spacing([16.0, 2.0])
             .show(ui, |ui| {
-                ui.weak("mtd9 备份 / 1 MiB 镜像");
+                ui.weak("mtd9 备份 / 2 MiB 镜像");
                 ui.monospace(self.src_factory.as_deref().unwrap_or("<未载入>"));
                 ui.end_row();
                 ui.weak("出厂文件");
@@ -934,7 +938,7 @@ impl Editor {
 
         ui.add_space(8.0);
         ui.weak("mtd9 = 整个 UBI 设备（25 MiB / 200 个 128 KiB PEB），只有一个动态卷 fhdata（178 LEB），卷上是 UBIFS。");
-        ui.weak("1 MiB 镜像用专属 magic `AN4-1MiB`：头部固定偏移放身份，其余文件进 TOC + zlib 载荷。");
+        ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，其余文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
         ui.weak("身份字段（SN / MAC / GPON SN / 密码）导出时会回写 factory_conf，保持文本与头部一致。");
         ui.weak("导入时按 sqnum 取 UBIFS 每个 key 的最新副本；`.factory_conf.uci-*` 是写入中间态，自动跳过。");
     }
@@ -1075,7 +1079,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.2.0",
+        "AN758X Factory 编辑器 v0.3.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

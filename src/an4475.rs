@@ -1,4 +1,4 @@
-//! AN4475（10G PON ONT）出厂数据：mtd9 → 1 MiB 紧凑容器。
+//! AN4475（10G PON ONT）出厂数据：mtd9 → 2 MiB 紧凑容器。
 //!
 //! ## mtd9 里到底是什么
 //!
@@ -38,10 +38,10 @@
 //!
 //! 因此这里用自描述的容器：**头部固定偏移放身份字段**（消费方不解析 TOC 也能
 //! 直接读到 SN/MAC），**TOC + zlib 载荷放其余全部文件**。EEPROM 压到约
-//! 195 KiB，整包约 211 KiB，1 MiB 余量充足。
+//! 195 KiB，整包约 211 KiB，2 MiB 余量非常充足（载荷只用掉约 10%）。
 //!
 //! ```text
-//! 0x000000  8   magic "AN4-1MiB"
+//! 0x000000  8   magic "AN4-2MiB"（旧镜像为 "AN4-1MiB"，同样可读）
 //! 0x000008  4   版本 = 1
 //! 0x00000C  4   文件数
 //! 0x000010  4   TOC 偏移 = 0x1000
@@ -57,7 +57,7 @@
 //! 0x000060  54  派生 MAC 9 项：internet/tr069/voip/priprotocol + eth1..eth5
 //! 0x001000      TOC，每项 48 字节（名 32 + off/raw/stored 各 4 + 压缩标志 1）
 //! 0x002000      载荷（各文件 zlib 或原样）
-//! ---------- 载荷之后至 0x100000 全 0xFF ----------
+//! ---------- 载荷之后至 0x200000 全 0xFF ----------
 //! ```
 //!
 //! ## MAC 派生规律（真机实证）
@@ -87,9 +87,15 @@ const AN_UBI_VID_OFF: usize = 0x800;
 const AN_UBI_DATA_OFF: usize = 0x1000;
 const AN_UBIFS_MAGIC: [u8; 4] = [0x31, 0x18, 0x10, 0x06];
 
-/// 紧凑镜像总长：1 MiB。
-pub const AN_COMPACT_SIZE: usize = 0x100000;
-pub const AN_COMPACT_MAGIC: [u8; 8] = *b"AN4-1MiB";
+/// 紧凑镜像总长：2 MiB。
+///
+/// AN4475 的出厂分区按 2 MiB 规划（原 1 MiB 版装得下，但余量只有 ~800 KiB，
+/// 且部分批次的分区表就按 2 MiB 给）；镜像尾部一律填 `0xFF`。
+pub const AN_COMPACT_SIZE: usize = 0x200000;
+/// 当前 magic，末四位标出容量。
+pub const AN_COMPACT_MAGIC: [u8; 8] = *b"AN4-2MiB";
+/// 旧版 1 MiB 容器 magic：仍可读入，再导出时统一升级为 2 MiB。
+pub const AN_COMPACT_MAGIC_V1: [u8; 8] = *b"AN4-1MiB";
 pub const AN_COMPACT_VERSION: u32 = 1;
 
 pub const AN_TOC_OFF: usize = 0x1000;
@@ -272,7 +278,7 @@ impl An4475 {
         s
     }
 
-    /// 打包 1 MiB 容器。
+    /// 打包 2 MiB 容器。
     ///
     /// 身份字段会先回写 `factory_conf`（保持文本与头部一致），再压缩入包。
     pub fn encode_compact(&self) -> Result<Vec<u8>, String> {
@@ -335,7 +341,7 @@ impl An4475 {
             };
             if cursor + blob.len() > AN_COMPACT_SIZE {
                 return Err(format!(
-                    "载荷超出 1 MiB：{} 需要写到 0x{:06X}",
+                    "载荷超出 2 MiB：{} 需要写到 0x{:06X}",
                     name,
                     cursor + blob.len()
                 ));
@@ -359,7 +365,20 @@ impl An4475 {
 // ---- 读回 ---------------------------------------------------------------
 
 pub fn is_compact(data: &[u8]) -> bool {
-    data.len() >= AN_COMPACT_SIZE && data.starts_with(&AN_COMPACT_MAGIC)
+    (data.len() >= AN_COMPACT_SIZE && data.starts_with(&AN_COMPACT_MAGIC))
+        || (data.len() >= AN_COMPACT_SIZE_V1 && data.starts_with(&AN_COMPACT_MAGIC_V1))
+}
+
+/// 旧版 1 MiB 容器的长度，仅用于识别。
+pub const AN_COMPACT_SIZE_V1: usize = 0x100000;
+
+/// 容器 magic 的可读名字（状态栏显示用）。
+pub fn compact_magic_name(data: &[u8]) -> &'static str {
+    if data.starts_with(&AN_COMPACT_MAGIC_V1) {
+        "AN4-1MiB 容器（旧版，导出将升级为 2 MiB）"
+    } else {
+        "AN4-2MiB 容器"
+    }
 }
 
 /// 是不是 mtd9 备份：UBI 魔数 + 卷表里有 `fhdata`。
@@ -665,7 +684,7 @@ fn uci_set(text: &str, key: &str, value: &str) -> String {
     out.join("\n")
 }
 
-/// 把身份字段回写 `factory_conf`，保证 1 MiB 头部与文本内容一致。
+/// 把身份字段回写 `factory_conf`，保证容器头部与文本内容一致。
 fn apply_identity(
     files: &[AnFile],
     sn: &str,

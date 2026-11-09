@@ -635,7 +635,7 @@ def parse_volume(data):
 
 
 # ===========================================================================
-# AN4475：mtd9（UBI 卷 fhdata / UBIFS）→ 1 MiB 紧凑容器
+# AN4475：mtd9（UBI 卷 fhdata / UBIFS）→ 2 MiB 紧凑容器
 # ===========================================================================
 #
 # 真机 mtd9 是一整个 UBI 设备（PEB 128 KiB，共 200 个 = 25 MiB），里面只有
@@ -647,16 +647,18 @@ def parse_volume(data):
 # SN/MAC 都在 `factory_conf` 里明文躺着，不需要从 AL-MAC 里反推。但也因此
 # 单机唯一数据（12 套 MAC、GPON SN/密码、BOSA 校准表、MT7993 EEPROM）体积
 # 达到 1.4 MB，其中 EEPROM 一个文件就 1.32 MiB —— 超过 1 MiB 镜像容量，
-# 所以 1 MiB 镜像采用「头部身份 + TOC + zlib 载荷」的容器结构（EEPROM 压到
-# ~195 KiB）。详见 README。
+# 所以镜像采用「头部身份 + TOC + zlib 载荷」的容器结构（EEPROM 压到 ~195
+# KiB）。容器长度按 2 MiB 规划（magic `AN4-2MiB`），旧版 1 MiB 容器仍可读入。
 
 AN_UBI_PEB = 0x20000
 AN_UBI_VID_OFF = 0x800
 AN_UBI_DATA_OFF = 0x1000
 AN_UBIFS_MAGIC = b"\x31\x18\x10\x06"
 
-AN_COMPACT_SIZE = 0x100000
-AN_COMPACT_MAGIC = b"AN4-1MiB"
+AN_COMPACT_SIZE = 0x200000
+AN_COMPACT_MAGIC = b"AN4-2MiB"
+AN_COMPACT_MAGIC_V1 = b"AN4-1MiB"      # 旧版 1 MiB 容器，仅用于读取兼容
+AN_COMPACT_SIZE_V1 = 0x100000
 AN_COMPACT_VERSION = 1
 AN_TOC_OFF = 0x1000
 AN_PAYLOAD_OFF = 0x2000
@@ -972,11 +974,11 @@ def parse_an4475_mtd9(data):
     }
 
 
-# ---- 1 MiB 容器 ----------------------------------------------------------
+# ---- 2 MiB 容器 ----------------------------------------------------------
 
-def encode_an4475_1mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
+def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
                        wifi_2g4=None, wifi_5g=None):
-    """打包 1 MiB 容器。文件按「能压就压」存放，超出容量直接报错。"""
+    """打包 2 MiB 容器。文件按「能压就压」存放，超出容量直接报错。"""
     d24, d5g = an4475_wifi_defaults(base_mac)
     wifi_2g4 = wifi_2g4 or d24
     wifi_5g = wifi_5g or d5g
@@ -1016,7 +1018,7 @@ def encode_an4475_1mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
         compr = 1 if use is packed else 0
         if cursor + len(use) > AN_COMPACT_SIZE:
             raise ValueError(
-                "载荷超出 1 MiB（%s 起需要 %d 字节）" % (name, cursor + len(use))
+                "载荷超出 2 MiB（%s 起需要 %d 字节）" % (name, cursor + len(use))
             )
         img[cursor:cursor + len(use)] = use
         ent = AN_TOC_OFF + idx * AN_TOC_ENTRY
@@ -1032,11 +1034,13 @@ def encode_an4475_1mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
 
 
 def is_an4475_compact(data):
-    return len(data) >= AN_COMPACT_SIZE and data[:8] == AN_COMPACT_MAGIC
+    """2 MiB 新版或旧版 1 MiB 容器都算。"""
+    return ((len(data) >= AN_COMPACT_SIZE and data[:8] == AN_COMPACT_MAGIC)
+            or (len(data) >= AN_COMPACT_SIZE_V1 and data[:8] == AN_COMPACT_MAGIC_V1))
 
 
 def parse_an4475_compact(data):
-    """读回 1 MiB 容器：头部身份字段 + 解压后的文件表。"""
+    """读回容器：头部身份字段 + 解压后的文件表（1/2 MiB 布局相同）。"""
     files = {}
     count = struct.unpack("<I", data[0x0C:0x10])[0]
     for idx in range(min(count, AN_MAX_FILES)):
@@ -1108,8 +1112,8 @@ def main():
     h.add_argument("--mac", help="生成用 label MAC，省略则沿用 --bin 里的")
     h.add_argument("-o", "--out", help="输出 512 KiB 镜像路径")
 
-    a = sub.add_parser("an4475", help="AN4475: 解析 mtd9 备份 / 生成 1 MiB 容器")
-    a.add_argument("--bin", help="mtd9 备份 (.bin) 或已生成的 AN4-1MiB 镜像")
+    a = sub.add_parser("an4475", help="AN4475: 解析 mtd9 备份 / 生成 2 MiB 容器")
+    a.add_argument("--bin", help="mtd9 备份 (.bin) 或已生成的 AN4-2MiB / AN4-1MiB 镜像")
     a.add_argument("--sn", help="设备序列号（17 字符）")
     a.add_argument("--gpon-sn", help="GPON SN，16 位 hex（含 FHTT 厂商码）")
     a.add_argument("--gpon-pw", help="GPON 密码（10 字符 ASCII）")
@@ -1117,7 +1121,7 @@ def main():
     a.add_argument("--eth-mac", help="LAN 基址 MAC（eth1mac）")
     a.add_argument("--wifi-24", help="2.4G Wi-Fi MAC（写 EEPROM +4 与 APMAC_1）")
     a.add_argument("--wifi-5g", help="5G Wi-Fi MAC（写 EEPROM +0x0A 与 APMAC_2）")
-    a.add_argument("-o", "--out", help="输出 1 MiB 镜像路径")
+    a.add_argument("-o", "--out", help="输出 2 MiB 镜像路径")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -1255,7 +1259,9 @@ def main():
             data = open(args.bin, "rb").read()
             if is_an4475_compact(data):
                 info = parse_an4475_compact(data)
-                print("文件: %s (%d 字节) · AN4-1MiB 容器" % (args.bin, len(data)))
+                magic = ("AN4-1MiB 容器（旧版，导出将升级为 2 MiB）"
+                         if data[:8] == AN_COMPACT_MAGIC_V1 else "AN4-2MiB 容器")
+                print("文件: %s (%d 字节) · %s" % (args.bin, len(data), magic))
             else:
                 if not looks_like_an4475_volume(data):
                     print("警告: %s 不像 AN4475 的 mtd9（缺 UBI 魔数或 fhdata 卷）"
@@ -1321,9 +1327,9 @@ def main():
                      "" if wifi5g else "（约定默认 +%d）" % AN_WIFI_OFFSET_5G))
         if args.out:
             if not (sn and base and eth and files):
-                sys.exit("生成 1 MiB 需要 --bin 提供出厂文件与身份"
+                sys.exit("生成 2 MiB 需要 --bin 提供出厂文件与身份"
                          "（可再用 --sn/--mac 覆盖）")
-            img = encode_an4475_1mib(sn, gpon_sn, gpon_pw, base, eth, files,
+            img = encode_an4475_2mib(sn, gpon_sn, gpon_pw, base, eth, files,
                                      wifi24, wifi5g)
             open(args.out, "wb").write(img)
             print("已写出 %d 字节 -> %s" % (len(img), args.out))
