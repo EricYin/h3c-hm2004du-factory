@@ -57,6 +57,8 @@ impl Kind {
 
 struct Editor {
     kind: Kind,
+    /// 机型列表是否展开（内联展开，不用 ComboBox 的跨帧弹层）。
+    model_open: bool,
     factory: Factory,
     /// 从机数据。切到 HL202 机型时使用，与 `factory` 互不影响。
     hl202: Hl202,
@@ -154,6 +156,7 @@ impl Editor {
     /// 已载入的数据各自留在 factory / hl202 / an 里，不会被覆盖。
     fn switch_kind(&mut self, kind: Kind) {
         self.kind = kind;
+        self.model_open = false;
         self.src_factory = None;
         self.src_downlink = None;
         self.gud.clear();
@@ -330,6 +333,11 @@ impl eframe::App for Editor {
         // ---- 顶栏：标题 ----
         ui.horizontal(|ui| {
             ui.heading("AN758X Factory");
+            ui.label(
+                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .weak()
+                    .small(),
+            );
             ui.separator();
             ui.label(
                 egui::RichText::new("H3C HM2004-DU / HL202-DU / AN4475 出厂分区编辑器").weak(),
@@ -358,48 +366,45 @@ impl eframe::App for Editor {
             }
         }
 
-        // ---- 机型下拉 ----
-        // 单独占一行，不再和标题挤在一起：
-        //  1) `ComboBox` 的弹层宽度直接取自按钮宽度，而按钮宽度又被
-        //     `ui.available_width()` 夹住；跟在 heading 后面时只剩 150 px 左右，
-        //     "AN4475 (10G PON)" 会被压窄，看着像点不开。
-        //  2) 放在行首能让弹层向左对齐，鼠标移动路径稳定。
-        // 三套布局互不相通（magic 不同），切换只是换面板，已载入的数据各自
-        // 保留在 factory / hl202 / an 里，不会互相覆盖。
+        // ---- 机型选择 ----
+        // 这里**故意不用 `egui::ComboBox`**。它的弹层是一个独立 `Area`，开合状态
+        // 存在 `Memory` 里、跨帧读取；在部分 Windows / 远程桌面环境下，点击后
+        // 窗口会进入等待状态，要等下一次鼠标移动才重绘，表现就是"点了没反应"。
+        // 改成内联展开后，列表在**点击的同一帧**就画出来了，不依赖任何跨帧
+        // 弹层状态，也不依赖重绘调度：
+        //   - 整个按钮（含"机型："三个字）都是点击区，点文字也能展开；
+        //   - 条目是普通 Button，整行 292×30 都可点；
+        //   - 选中后立即收起。
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("机型").strong());
-            let mut picked = self.kind;
-            // 按钮内边距放大到 8×6：默认下拉框只有 20 px 高，紧贴窗口上沿时
-            // 鼠标稍偏一点就落到标题栏（变成拖动窗口），实际体验就是"点不动"。
-            // 撑到 ~32 px 后整块都是可点区域。
-            ui.scope(|ui| {
-                ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
-                egui::ComboBox::from_id_salt("an758x_model_select")
-                    .selected_text(egui::RichText::new(self.kind.label()).size(15.0))
-                    .width(250.0)
-                    .height(220.0)
-                    .show_ui(ui, |ui| {
-                        // 弹层里的选中背景默认只包住文字，条目之间点空白没反应，
-                        // 手感像一排纯文本。撑到按钮宽度后整行都可点。
-                        ui.set_min_width(238.0);
-                        for k in Kind::ALL {
-                            if ui
-                                .selectable_label(
-                                    picked == k,
-                                    egui::RichText::new(k.label()).size(15.0),
-                                )
-                                .clicked()
-                            {
-                                picked = k;
-                            }
-                        }
-                    });
-            });
-            if picked != self.kind {
-                self.switch_kind(picked);
+            let label = format!("机型：{}   ▼", self.kind.label());
+            let btn = egui::Button::new(egui::RichText::new(label).size(15.0));
+            if ui.add_sized([300.0, 34.0], btn).clicked() {
+                self.model_open = !self.model_open;
+                // 打开/收起后立刻要一帧，避免窗口在等待输入时"看着没动"。
+                ui.ctx().request_repaint();
             }
-            ui.label(egui::RichText::new("点击展开选择（Ctrl+1/2/3）").weak().small());
+            ui.label(egui::RichText::new("点击展开（Ctrl+1/2/3）").weak().small());
         });
+        if self.model_open {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(300.0);
+                for k in Kind::ALL {
+                    let selected = self.kind == k;
+                    let text = if selected {
+                        egui::RichText::new(format!("✔ {}", k.label())).size(15.0)
+                    } else {
+                        egui::RichText::new(format!("   {}", k.label())).size(15.0)
+                    };
+                    let item = egui::Button::new(text)
+                        .selected(selected)
+                        .wrap_mode(egui::TextWrapMode::Extend);
+                    if ui.add_sized([292.0, 30.0], item).clicked() {
+                        self.switch_kind(k);
+                        self.model_open = false;
+                    }
+                }
+            });
+        }
         // 动作按钮：左对齐 + 自动换行。
         // 原先是「右对齐单行」，760 px 下 8 个按钮总宽超出，右对齐会把超出
         // 的部分推到可视区左侧之外 —— 表现为「保存 1 MiB」只剩半个字。
@@ -1070,13 +1075,14 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器",
+        "AN758X Factory 编辑器 v0.2.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
             apply_light_theme(&cc.egui_ctx);
             let mut ed = Editor {
                 kind: Kind::Hm2004,
+                model_open: false,
                 factory: Factory::new(),
                 hl202: Hl202::new(),
                 an: An4475::new(),
