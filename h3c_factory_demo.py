@@ -634,6 +634,450 @@ def parse_volume(data):
     return sn, label, cal, eep, dn, dnf
 
 
+# ===========================================================================
+# AN4475：mtd9（UBI 卷 fhdata / UBIFS）→ 1 MiB 紧凑容器
+# ===========================================================================
+#
+# 真机 mtd9 是一整个 UBI 设备（PEB 128 KiB，共 200 个 = 25 MiB），里面只有
+# 一个动态卷 `fhdata`（178 PEB ≈ 22.25 MiB），卷上是 UBIFS，装着 21 个出厂
+# 文件（另有 15 个 UCI 临时文件 `.factory_conf.uci-XXXXXX`，属写入中间态，
+# 不入镜像）。
+#
+# 与 H3C 两台机型最大的不同：AN4475 的出厂数据**全部是文本 UCI + 定长表**，
+# SN/MAC 都在 `factory_conf` 里明文躺着，不需要从 AL-MAC 里反推。但也因此
+# 单机唯一数据（12 套 MAC、GPON SN/密码、BOSA 校准表、MT7993 EEPROM）体积
+# 达到 1.4 MB，其中 EEPROM 一个文件就 1.32 MiB —— 超过 1 MiB 镜像容量，
+# 所以 1 MiB 镜像采用「头部身份 + TOC + zlib 载荷」的容器结构（EEPROM 压到
+# ~195 KiB）。详见 README。
+
+AN_UBI_PEB = 0x20000
+AN_UBI_VID_OFF = 0x800
+AN_UBI_DATA_OFF = 0x1000
+AN_UBIFS_MAGIC = b"\x31\x18\x10\x06"
+
+AN_COMPACT_SIZE = 0x100000
+AN_COMPACT_MAGIC = b"AN4-1MiB"
+AN_COMPACT_VERSION = 1
+AN_TOC_OFF = 0x1000
+AN_PAYLOAD_OFF = 0x2000
+AN_TOC_ENTRY = 48
+AN_NAME_MAX = 32
+AN_MAX_FILES = (AN_PAYLOAD_OFF - AN_TOC_OFF) // AN_TOC_ENTRY
+
+AN_SN_SIZE = 17
+AN_SN_CAP = 24
+AN_GPON_SN_SIZE = 8
+AN_GPON_PW_SIZE = 10
+
+AN_H_SN = 0x20
+AN_H_GPON_SN = 0x38
+AN_H_BASE_MAC = 0x40
+AN_H_ETH_MAC = 0x46
+AN_H_OUI = 0x4C
+AN_H_VENDOR = 0x4F
+AN_H_GPON_PW = 0x51
+AN_H_MACS = 0x60
+# 0x60 + 9×6 = 0x96，Wi-Fi 两位 MAC 紧接其后，到 0x1000 前还有很大余量。
+AN_H_WIFI_2G4 = 0x96
+AN_H_WIFI_5G = 0x9C
+
+# 城市宽带（CT）ONU 的 MAC 分配：基准 MAC 往上 +1/+2/+3/+8 依次是上网、
+# TR-069、VoIP、私有协议；LAN 口另取一个基址（真机上与基准 MAC 差
+# 0x0100_0021，属另一段预留），eth1..eth5 在自身基址上 +0..+4。
+AN_DERIVED = (
+    ("internetmac", 1),
+    ("tr069mac", 2),
+    ("voipmac", 3),
+    ("priprotocolmac", 8),
+)
+AN_ETH_NAMES = ("eth1mac", "eth2mac", "eth3mac", "eth4mac", "eth5mac")
+AN_MAIN_CONF = "factory_conf"
+
+# Wi-Fi 校准文件里也带 MAC。MT7993 的 EEPROM 头很短：device id + 版本 + 两个
+# MAC，之后 0x10..0x190 全 0，0x190 起才是射频校准。出厂值仍是芯片厂默认
+# （2.4G/5G 分别 00:0C:43:26:60:10 / :11，00:0C:43 是 MediaTek 的 OUI），
+# 说明产线没写这两位，得由本工具补。
+AN_WLAN_EEPROM = "MT7993_EEPROM.bin"
+AN_EEPROM_DEVICE_ID = 0x00          # u16 LE，MT7993 = 0x7993
+AN_EEPROM_VERSION = 0x02            # u16 LE，实测 2
+AN_EEPROM_MAC_2G4 = 0x04            # 6 字节
+AN_EEPROM_MAC_5G = 0x0A             # 6 字节
+AN_EEPROM_MAC_AREA = 0x10           # 0x10 起为 0 填充，MAC 区到此为止
+
+# factory_conf 里对应的两段。EEPROM 与应用层各存一份，必须一起改，
+# 否则驱动取哪个说不准。
+AN_APMAC_2G4 = "APMAC_1"
+AN_APMAC_5G = "APMAC_2"
+
+# 本工具约定的 Wi-Fi MAC 偏移（真机未写，无出厂实证，可在界面改）。
+AN_WIFI_OFFSET_2G4 = 6
+AN_WIFI_OFFSET_5G = 7
+
+
+def _mac_add(mac, n):
+    v = int.from_bytes(mac, "big") + n
+    return (v & 0xFFFFFFFFFFFF).to_bytes(6, "big")
+
+
+def an4475_derive(base_mac, eth_mac):
+    """按真机规律派生：网络侧 +1/+2/+3/+8，LAN 侧 +0..+4。"""
+    net = [(name, _mac_add(base_mac, off)) for name, off in AN_DERIVED]
+    lan = [(name, _mac_add(eth_mac, i)) for i, name in enumerate(AN_ETH_NAMES)]
+    return net + lan
+
+
+def an4475_wifi_defaults(base_mac):
+    """Wi-Fi 两位 MAC 的默认值。
+
+    真机出厂时 EEPROM 和 factory_conf 里都是芯片厂/OEM 占位值，没有可参照的
+    真实值，所以这里按基准 MAC 往后取两个未被占用的偏移（+6/+7）。纯约定，
+    界面上可改。
+    """
+    return (_mac_add(base_mac, AN_WIFI_OFFSET_2G4),
+            _mac_add(base_mac, AN_WIFI_OFFSET_5G))
+
+
+def an4475_eeprom_device_id(eeprom):
+    """EEPROM 头 2 字节小端 device id，MT7993 为 0x7993。"""
+    if len(eeprom) < 2:
+        return 0
+    return int.from_bytes(eeprom[:2], "little")
+
+
+def an4475_eeprom_macs(eeprom):
+    """读 EEPROM 里的 (2.4G, 5G) MAC；太短或全 0 时返回 None。"""
+    if len(eeprom) < AN_EEPROM_MAC_5G + 6:
+        return None
+    a = bytes(eeprom[AN_EEPROM_MAC_2G4:AN_EEPROM_MAC_2G4 + 6])
+    b = bytes(eeprom[AN_EEPROM_MAC_5G:AN_EEPROM_MAC_5G + 6])
+    if a in (b"\x00" * 6, b"\xff" * 6):
+        return None
+    return a, b
+
+
+def an4475_eeprom_set_macs(eeprom, mac_2g4, mac_5g):
+    """写回 EEPROM 的两位 MAC，其余字节（含校准表）原样保留。"""
+    if len(eeprom) < AN_EEPROM_MAC_5G + 6:
+        raise ValueError("Wi-Fi EEPROM 只有 %d 字节，放不下 MAC 头" % len(eeprom))
+    buf = bytearray(eeprom)
+    buf[AN_EEPROM_MAC_2G4:AN_EEPROM_MAC_2G4 + 6] = mac_2g4
+    buf[AN_EEPROM_MAC_5G:AN_EEPROM_MAC_5G + 6] = mac_5g
+    return bytes(buf)
+
+
+# ---- UBIFS 读取 ----------------------------------------------------------
+
+def _ubifs_collect(data):
+    """扫 UBI 里所有 UBIFS 节点，按 sqnum 取每个 key 的最新副本。
+
+    返回 (dents, datas)：dents = {name: inum}，datas = {(inum, block): (size, compr, payload)}
+    """
+    dents, datas = {}, {}
+    n_peb = len(data) // AN_UBI_PEB
+    for i in range(n_peb):
+        peb = i * AN_UBI_PEB
+        if data[peb:peb + 4] != b"UBI#":
+            continue
+        if data[peb + AN_UBI_VID_OFF:peb + AN_UBI_VID_OFF + 4] != b"UBI!":
+            continue  # 未使用的 PEB
+        base = peb + AN_UBI_DATA_OFF
+        end = base + AN_UBI_PEB - AN_UBI_DATA_OFF
+        for p in range(base, end - 24, 8):
+            if data[p:p + 4] != AN_UBIFS_MAGIC:
+                continue
+            sqnum = struct.unpack("<Q", data[p + 8:p + 16])[0]
+            nlen = struct.unpack("<I", data[p + 0x10:p + 0x14])[0]
+            if not 24 <= nlen <= AN_UBI_PEB:
+                continue
+            ntype = data[p + 0x14]
+            key = data[p + 0x18:p + 0x28]
+            if ntype == 2:  # dent
+                inum = struct.unpack("<Q", data[p + 0x28:p + 0x30])[0]
+                nl = struct.unpack("<H", data[p + 0x32:p + 0x34])[0]
+                name = data[p + 0x38:p + 0x38 + nl].decode("utf-8", "replace")
+                if name not in dents or dents[name][0] < sqnum:
+                    dents[name] = (sqnum, inum)
+            elif ntype == 1:  # data
+                inum = struct.unpack("<I", key[0:4])[0]
+                blk = key[4:8]
+                size = struct.unpack("<I", data[p + 0x28:p + 0x2C])[0]
+                compr = struct.unpack("<H", data[p + 0x2C:p + 0x2E])[0]
+                k = (inum, blk)
+                if k not in datas or datas[k][0] < sqnum:
+                    datas[k] = (sqnum, size, compr, data[p + 0x30:p + nlen])
+    return dents, datas
+
+
+def _ubifs_inflate(payload, compr):
+    if compr == 0:
+        return payload
+    if compr == 2:  # zlib —— UBIFS 存的是裸 deflate（无 0x78 头）
+        try:
+            return zlib.decompress(payload, -15)
+        except zlib.error:
+            return b""
+    return b""  # 1=lzo / 3=zstd：本工具不支持，宁可缺文件也不猜
+
+
+def an4475_read_files(data):
+    """把 fhdata 卷还原成 {文件名: 内容}，跳过 UCI 临时文件。"""
+    dents, datas = _ubifs_collect(data)
+    out = {}
+    for name, (_sq, inum) in dents.items():
+        if name.startswith("."):
+            continue
+        blocks = sorted(
+            ((k[1], v) for k, v in datas.items() if k[0] == inum),
+            key=lambda x: x[0],
+        )
+        buf = bytearray()
+        for _blk, (_sq2, size, compr, payload) in blocks:
+            chunk = _ubifs_inflate(payload, compr)
+            buf.extend(chunk[:size] if size <= len(chunk) else chunk)
+        out[name] = bytes(buf)
+    return out
+
+
+# ---- UCI 文本读写 --------------------------------------------------------
+
+def _uci_get(text, key):
+    want = "config key '%s'" % key
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() != want:
+            continue
+        for nxt in lines[i + 1:]:
+            s = nxt.strip()
+            if s.startswith("config "):
+                break
+            if s.startswith("option value '") and s.endswith("'"):
+                return s[len("option value '"):-1]
+        break
+    return ""
+
+
+def _uci_set(text, key, value):
+    """把 `config key '<key>'` 段里的 option value 换掉，其余字节保持原样。"""
+    want = "config key '%s'" % key
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        if line.strip() != want:
+            continue
+        while i < len(lines) and not lines[i].lstrip().startswith("config "):
+            cur = lines[i]
+            s = cur.strip()
+            if s.startswith("option value '") and s.endswith("'"):
+                indent = cur[:len(cur) - len(cur.lstrip())]
+                out.append("%soption value '%s'" % (indent, value))
+            else:
+                out.append(cur)
+            i += 1
+    return "\n".join(out)
+
+
+def apply_an4475_identity(files, sn, gpon_sn, gpon_pw, base_mac, eth_mac,
+                          wifi_2g4=None, wifi_5g=None):
+    """把身份字段写回 factory_conf（以及 Wi-Fi EEPROM），保证三处一致。
+
+    只改**单例**字段；SSID / 密码 / 光模块序列号 / BOSA 校准原样保留。
+    `wifi_2g4` / `wifi_5g` 为 None 时不动 Wi-Fi 那两位。
+    """
+    conf = files.get(AN_MAIN_CONF)
+    if conf is None:
+        return dict(files)
+    text = conf.decode("utf-8", "ignore")
+    pairs = [
+        ("SerialNumber", sn),
+        ("VendorCode", "FH"),
+        ("GponSN", gpon_sn.hex().upper()),
+        ("GPONPassWord", gpon_pw.encode("ascii").hex().upper()),
+        ("ManufacturerOUI", base_mac[:3].hex().upper()),
+        ("base_mac", mac_to_string(base_mac)),
+        ("brmac", mac_to_string(base_mac)),
+        ("ponmac", mac_to_string(base_mac)),
+    ]
+    for name, mac in an4475_derive(base_mac, eth_mac):
+        pairs.append((name, mac_to_string(mac)))
+    if wifi_2g4 is not None:
+        pairs.append((AN_APMAC_2G4, mac_to_string(wifi_2g4)))
+    if wifi_5g is not None:
+        pairs.append((AN_APMAC_5G, mac_to_string(wifi_5g)))
+    for key, value in pairs:
+        text = _uci_set(text, key, value)
+    out = dict(files)
+    out[AN_MAIN_CONF] = text.encode("utf-8")
+
+    # Wi-Fi EEPROM 里同样的两位 MAC 也要跟着走，否则驱动可能读到旧值。
+    if (wifi_2g4 is not None or wifi_5g is not None) and AN_WLAN_EEPROM in out:
+        cur = an4475_eeprom_macs(out[AN_WLAN_EEPROM]) or an4475_wifi_defaults(base_mac)
+        out[AN_WLAN_EEPROM] = an4475_eeprom_set_macs(
+            out[AN_WLAN_EEPROM],
+            cur[0] if wifi_2g4 is None else wifi_2g4,
+            cur[1] if wifi_5g is None else wifi_5g,
+        )
+    return out
+
+
+# ---- mtd9 解析 -----------------------------------------------------------
+
+def looks_like_an4475_volume(data):
+    """mtd9 备份判据：UBI 魔数 + 卷表里出现 fhdata。"""
+    if len(data) < AN_UBI_PEB or data[:4] != b"UBI#":
+        return False
+    return b"fhdata" in data[:AN_UBI_PEB]
+
+
+def parse_an4475_mtd9(data):
+    """解析 mtd9 备份，返回身份字段与全部出厂文件。"""
+    files = an4475_read_files(data)
+    text = files.get(AN_MAIN_CONF, b"").decode("utf-8", "ignore")
+    gpon_raw = _uci_get(text, "GponSN")
+    pw_raw = _uci_get(text, "GPONPassWord")
+    try:
+        gpon_sn = bytes.fromhex(gpon_raw)[:AN_GPON_SN_SIZE]
+    except ValueError:
+        gpon_sn = b"\xff" * AN_GPON_SN_SIZE
+    try:
+        gpon_pw = bytes.fromhex(pw_raw).decode("ascii", "ignore")[:AN_GPON_PW_SIZE]
+    except ValueError:
+        gpon_pw = ""
+    eeprom = files.get(AN_WLAN_EEPROM, b"")
+    eep_macs = an4475_eeprom_macs(eeprom)
+    base_mac = parse_mac(_uci_get(text, "base_mac")) or b"\x00" * 6
+    # EEPROM 里的值才是驱动实际读到的，优先用它；缺失时退回 factory_conf 的
+    # APMAC_1/2，再退到按基准 MAC 推算的约定值。
+    d24, d5g = an4475_wifi_defaults(base_mac)
+    wifi_2g4 = (eep_macs[0] if eep_macs else None) or parse_mac(
+        _uci_get(text, AN_APMAC_2G4)) or d24
+    wifi_5g = (eep_macs[1] if eep_macs else None) or parse_mac(
+        _uci_get(text, AN_APMAC_5G)) or d5g
+    return {
+        "sn": _uci_get(text, "SerialNumber")[:AN_SN_SIZE],
+        "gpon_sn": gpon_sn,
+        "gpon_pw": gpon_pw,
+        "base_mac": base_mac,
+        "eth_mac": parse_mac(_uci_get(text, "eth1mac")) or b"\x00" * 6,
+        "wifi_2g4": wifi_2g4,
+        "wifi_5g": wifi_5g,
+        "eeprom_device_id": an4475_eeprom_device_id(eeprom),
+        "eeprom_size": len(eeprom),
+        "vendor": _uci_get(text, "VendorCode"),
+        "bosa": _uci_get(files.get("olt_bosa_info", b"").decode("utf-8", "ignore"),
+                         "olt_bosa_id"),
+        "files": files,
+    }
+
+
+# ---- 1 MiB 容器 ----------------------------------------------------------
+
+def encode_an4475_1mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
+                       wifi_2g4=None, wifi_5g=None):
+    """打包 1 MiB 容器。文件按「能压就压」存放，超出容量直接报错。"""
+    d24, d5g = an4475_wifi_defaults(base_mac)
+    wifi_2g4 = wifi_2g4 or d24
+    wifi_5g = wifi_5g or d5g
+    files = apply_an4475_identity(files, sn, gpon_sn, gpon_pw, base_mac, eth_mac,
+                                  wifi_2g4, wifi_5g)
+    names = sorted(files)
+    if len(names) > AN_MAX_FILES:
+        raise ValueError("文件数 %d 超过 TOC 上限 %d" % (len(names), AN_MAX_FILES))
+
+    img = bytearray(b"\xff" * AN_COMPACT_SIZE)
+    img[0:8] = AN_COMPACT_MAGIC
+    struct.pack_into("<I", img, 0x08, AN_COMPACT_VERSION)
+    struct.pack_into("<I", img, 0x0C, len(names))
+    struct.pack_into("<I", img, 0x10, AN_TOC_OFF)
+    struct.pack_into("<I", img, 0x14, AN_PAYLOAD_OFF)
+
+    snb = sn.encode("ascii", "ignore")[:AN_SN_SIZE]
+    img[AN_H_SN:AN_H_SN + len(snb)] = snb
+    img[AN_H_GPON_SN:AN_H_GPON_SN + AN_GPON_SN_SIZE] = gpon_sn[:AN_GPON_SN_SIZE]
+    img[AN_H_BASE_MAC:AN_H_BASE_MAC + 6] = base_mac
+    img[AN_H_ETH_MAC:AN_H_ETH_MAC + 6] = eth_mac
+    img[AN_H_OUI:AN_H_OUI + 3] = base_mac[:3]
+    img[AN_H_VENDOR:AN_H_VENDOR + 2] = b"FH"
+    pwb = gpon_pw.encode("ascii", "ignore")[:AN_GPON_PW_SIZE]
+    img[AN_H_GPON_PW:AN_H_GPON_PW + len(pwb)] = pwb
+    for i, (_name, mac) in enumerate(an4475_derive(base_mac, eth_mac)):
+        off = AN_H_MACS + i * 6
+        img[off:off + 6] = mac
+    img[AN_H_WIFI_2G4:AN_H_WIFI_2G4 + 6] = wifi_2g4
+    img[AN_H_WIFI_5G:AN_H_WIFI_5G + 6] = wifi_5g
+
+    cursor = AN_PAYLOAD_OFF
+    for idx, name in enumerate(names):
+        raw = files[name]
+        packed = zlib.compress(raw, 9)
+        use = packed if len(packed) < len(raw) - 16 else raw
+        compr = 1 if use is packed else 0
+        if cursor + len(use) > AN_COMPACT_SIZE:
+            raise ValueError(
+                "载荷超出 1 MiB（%s 起需要 %d 字节）" % (name, cursor + len(use))
+            )
+        img[cursor:cursor + len(use)] = use
+        ent = AN_TOC_OFF + idx * AN_TOC_ENTRY
+        nb = name.encode("utf-8")[:AN_NAME_MAX - 1]
+        img[ent:ent + len(nb)] = nb
+        struct.pack_into("<III", img, ent + AN_NAME_MAX, cursor - AN_PAYLOAD_OFF,
+                         len(raw), len(use))
+        img[ent + AN_NAME_MAX + 12] = compr
+        cursor += len(use)
+
+    struct.pack_into("<I", img, 0x18, cursor - AN_PAYLOAD_OFF)
+    return bytes(img)
+
+
+def is_an4475_compact(data):
+    return len(data) >= AN_COMPACT_SIZE and data[:8] == AN_COMPACT_MAGIC
+
+
+def parse_an4475_compact(data):
+    """读回 1 MiB 容器：头部身份字段 + 解压后的文件表。"""
+    files = {}
+    count = struct.unpack("<I", data[0x0C:0x10])[0]
+    for idx in range(min(count, AN_MAX_FILES)):
+        ent = AN_TOC_OFF + idx * AN_TOC_ENTRY
+        raw_name = data[ent:ent + AN_NAME_MAX].split(b"\x00")[0]
+        name = raw_name.decode("utf-8", "ignore")
+        off, raw_len, stored_len = struct.unpack(
+            "<III", data[ent + AN_NAME_MAX:ent + AN_NAME_MAX + 12]
+        )
+        compr = data[ent + AN_NAME_MAX + 12]
+        blob = data[AN_PAYLOAD_OFF + off:AN_PAYLOAD_OFF + off + stored_len]
+        if compr == 1:
+            try:
+                blob = zlib.decompress(blob)
+            except zlib.error:
+                blob = b""
+        files[name] = blob[:raw_len]
+    sn = data[AN_H_SN:AN_H_SN + AN_SN_CAP].split(b"\x00")[0].decode("ascii", "ignore")
+    base_mac = bytes(data[AN_H_BASE_MAC:AN_H_BASE_MAC + 6])
+    # 头部有就信头部；旧镜像那两位是 0xFF，退回 EEPROM 里读。
+    wifi_2g4 = bytes(data[AN_H_WIFI_2G4:AN_H_WIFI_2G4 + 6])
+    wifi_5g = bytes(data[AN_H_WIFI_5G:AN_H_WIFI_5G + 6])
+    if wifi_2g4 == b"\xff" * 6 or wifi_5g == b"\xff" * 6:
+        eep = an4475_eeprom_macs(files.get(AN_WLAN_EEPROM, b""))
+        if eep:
+            wifi_2g4, wifi_5g = eep
+    return {
+        "sn": sn.strip(),
+        "gpon_sn": bytes(data[AN_H_GPON_SN:AN_H_GPON_SN + AN_GPON_SN_SIZE]),
+        "gpon_pw": data[AN_H_GPON_PW:AN_H_GPON_PW + AN_GPON_PW_SIZE]
+        .split(b"\x00")[0].decode("ascii", "ignore").strip(),
+        "base_mac": base_mac,
+        "eth_mac": bytes(data[AN_H_ETH_MAC:AN_H_ETH_MAC + 6]),
+        "wifi_2g4": wifi_2g4,
+        "wifi_5g": wifi_5g,
+        "eeprom_device_id": an4475_eeprom_device_id(files.get(AN_WLAN_EEPROM, b"")),
+        "files": files,
+    }
+
+
+
 def main():
     ap = argparse.ArgumentParser(description="H3C HM2004-DU factory 工具")
     sub = ap.add_subparsers(dest="cmd")
@@ -663,6 +1107,17 @@ def main():
     h.add_argument("--sn", help="生成用 SN（12 字符），省略则沿用 --bin 里的")
     h.add_argument("--mac", help="生成用 label MAC，省略则沿用 --bin 里的")
     h.add_argument("-o", "--out", help="输出 512 KiB 镜像路径")
+
+    a = sub.add_parser("an4475", help="AN4475: 解析 mtd9 备份 / 生成 1 MiB 容器")
+    a.add_argument("--bin", help="mtd9 备份 (.bin) 或已生成的 AN4-1MiB 镜像")
+    a.add_argument("--sn", help="设备序列号（17 字符）")
+    a.add_argument("--gpon-sn", help="GPON SN，16 位 hex（含 FHTT 厂商码）")
+    a.add_argument("--gpon-pw", help="GPON 密码（10 字符 ASCII）")
+    a.add_argument("--mac", help="基准 MAC（base_mac / brmac / ponmac）")
+    a.add_argument("--eth-mac", help="LAN 基址 MAC（eth1mac）")
+    a.add_argument("--wifi-24", help="2.4G Wi-Fi MAC（写 EEPROM +4 与 APMAC_1）")
+    a.add_argument("--wifi-5g", help="5G Wi-Fi MAC（写 EEPROM +0x0A 与 APMAC_2）")
+    a.add_argument("-o", "--out", help="输出 1 MiB 镜像路径")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -791,6 +1246,89 @@ def main():
             print("  magic     : %r" % img[:8])
             print("  SN        : %s" % sn)
             print("  Label MAC : %s" % mac_to_string(label))
+    elif args.cmd == "an4475":
+        sn, gpon_sn, gpon_pw = "", b"\xff" * AN_GPON_SN_SIZE, ""
+        base = eth = wifi24 = wifi5g = None
+        files = {}
+        devid = 0
+        if args.bin:
+            data = open(args.bin, "rb").read()
+            if is_an4475_compact(data):
+                info = parse_an4475_compact(data)
+                print("文件: %s (%d 字节) · AN4-1MiB 容器" % (args.bin, len(data)))
+            else:
+                if not looks_like_an4475_volume(data):
+                    print("警告: %s 不像 AN4475 的 mtd9（缺 UBI 魔数或 fhdata 卷）"
+                          % args.bin)
+                info = parse_an4475_mtd9(data)
+                print("文件: %s (%d 字节) · mtd9 (UBI 卷 fhdata / UBIFS)"
+                      % (args.bin, len(data)))
+            sn = info["sn"]
+            gpon_sn, gpon_pw = info["gpon_sn"], info["gpon_pw"]
+            base, eth = info["base_mac"], info["eth_mac"]
+            wifi24, wifi5g = info["wifi_2g4"], info["wifi_5g"]
+            devid = info.get("eeprom_device_id", 0)
+            files = info["files"]
+            eep = files.get(AN_WLAN_EEPROM)
+            if eep is not None:
+                print("  Wi-Fi     : %s，%d 字节，device id 0x%04X"
+                      % (AN_WLAN_EEPROM, len(eep), devid))
+                if devid != 0x7993:
+                    print("    警告: device id 0x%04X != 0x7993，可能不是 MT7993"
+                          % devid)
+            print("  出厂文件  : %d 个，共 %d 字节"
+                  % (len(files), sum(len(v) for v in files.values())))
+            for name in sorted(files):
+                print("    %-24s %8d" % (name, len(files[name])))
+        if args.sn:
+            sn = args.sn
+        if args.gpon_sn:
+            gpon_sn = bytes.fromhex(args.gpon_sn)
+        if args.gpon_pw:
+            gpon_pw = args.gpon_pw
+        if args.mac:
+            base = parse_mac(args.mac)
+            if not base:
+                sys.exit("MAC 无效: %s" % args.mac)
+        if args.eth_mac:
+            eth = parse_mac(args.eth_mac)
+            if not eth:
+                sys.exit("MAC 无效: %s" % args.eth_mac)
+        for opt, val, name in ((args.wifi_24, "wifi24", "2.4G"), (args.wifi_5g, "wifi5g", "5G")):
+            if not opt:
+                continue
+            m = parse_mac(opt)
+            if not m:
+                sys.exit("%s MAC 无效: %s" % (name, opt))
+            if val == "wifi24":
+                wifi24 = m
+            else:
+                wifi5g = m
+        if base and eth:
+            print("  Serial    : %s" % sn)
+            print("  GPON SN   : %s" % gpon_sn.hex().upper())
+            print("  GPON 密码 : %s" % gpon_pw)
+            print("  基准 MAC  : %s" % mac_to_string(base))
+            print("  LAN 基址  : %s" % mac_to_string(eth))
+            for name, mac in an4475_derive(base, eth):
+                print("    %-16s %s" % (name, mac_to_string(mac)))
+            d24, d5g = an4475_wifi_defaults(base)
+            print("  2.4G MAC  : %s%s"
+                  % (mac_to_string(wifi24 or d24),
+                     "" if wifi24 else "（约定默认 +%d）" % AN_WIFI_OFFSET_2G4))
+            print("  5G MAC    : %s%s"
+                  % (mac_to_string(wifi5g or d5g),
+                     "" if wifi5g else "（约定默认 +%d）" % AN_WIFI_OFFSET_5G))
+        if args.out:
+            if not (sn and base and eth and files):
+                sys.exit("生成 1 MiB 需要 --bin 提供出厂文件与身份"
+                         "（可再用 --sn/--mac 覆盖）")
+            img = encode_an4475_1mib(sn, gpon_sn, gpon_pw, base, eth, files,
+                                     wifi24, wifi5g)
+            open(args.out, "wb").write(img)
+            print("已写出 %d 字节 -> %s" % (len(img), args.out))
+            print("  magic     : %r  载荷 %d 字节"
+                  % (img[:8], int.from_bytes(img[0x18:0x1C], "little")))
     else:
         ap.print_help()
 

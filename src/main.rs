@@ -12,11 +12,13 @@
 //! Build: `cargo build --release`
 //! Run:   `cargo run --release`
 
+mod an4475;
 mod font;
 mod hl202;
 mod import;
 mod model;
 
+use an4475::{An4475, AN_SN_SIZE};
 use eframe::egui;
 use hl202::{
     parse_compact as hl_parse_compact, Hl202, HL_BOB_SIZE, HL_EEPROM_SIZE, HL_PON_CHIP, HL_SN_SIZE,
@@ -36,6 +38,21 @@ enum Kind {
     Hm2004,
     /// H3C HL202-DU（从机）：只有 mtd12（reservearea），无下行校准。
     Hl202,
+    /// AN4475（10G PON）：mtd9（UBI 卷 fhdata / UBIFS）→ 1 MiB 容器。
+    An4475,
+}
+
+impl Kind {
+    /// 下拉框里的显示名。三套布局互不通用，靠 magic 区分。
+    const ALL: [Kind; 3] = [Kind::Hm2004, Kind::Hl202, Kind::An4475];
+
+    fn label(&self) -> &'static str {
+        match self {
+            Kind::Hm2004 => "主机 HM2004-DU",
+            Kind::Hl202 => "从机 HL202-DU",
+            Kind::An4475 => "AN4475 (10G PON)",
+        }
+    }
 }
 
 struct Editor {
@@ -43,6 +60,18 @@ struct Editor {
     factory: Factory,
     /// 从机数据。切到 HL202 机型时使用，与 `factory` 互不影响。
     hl202: Hl202,
+    /// AN4475 数据：出厂文件 + 身份字段。
+    an: An4475,
+    /// AN4475 的 LAN 基址 MAC（eth1mac），与基准 MAC 是两段地址。
+    eth_mac: String,
+    /// AN4475 的 GPON SN（16 位 hex，含 "FHTT" 厂商码）。
+    gpon_sn: String,
+    /// AN4475 的 GPON 密码（10 字符 ASCII）。
+    gpon_pw: String,
+    /// AN4475 的 Wi-Fi 2.4G MAC（写 EEPROM +0x04 与 APMAC_1）。
+    wifi_2g4: String,
+    /// AN4475 的 Wi-Fi 5G MAC（写 EEPROM +0x0A 与 APMAC_2）。
+    wifi_5g: String,
     device_sn: String,
     label_mac: String,
     msg: String,
@@ -77,6 +106,71 @@ impl Editor {
             self.hl202.label_mac = m;
         }
         self.hl202.device_sn = self.device_sn.clone();
+    }
+
+    fn sync_from_an(&mut self) {
+        self.device_sn = self.an.device_sn.clone();
+        self.label_mac = an4475::mac_to_string(&self.an.base_mac);
+        self.eth_mac = an4475::mac_to_string(&self.an.eth_mac);
+        self.gpon_sn = self.an.gpon_sn.iter().map(|b| format!("{b:02X}")).collect();
+        self.gpon_pw = self.an.gpon_pw.clone();
+        self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
+        self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
+    }
+
+    fn apply_to_an(&mut self) {
+        if let Some(m) = an4475::parse_mac(&self.label_mac) {
+            self.an.base_mac = m;
+        }
+        if let Some(m) = an4475::parse_mac(&self.eth_mac) {
+            self.an.eth_mac = m;
+        }
+        if let Some(m) = an4475::parse_mac(&self.wifi_2g4) {
+            self.an.wifi_2g4 = m;
+        }
+        if let Some(m) = an4475::parse_mac(&self.wifi_5g) {
+            self.an.wifi_5g = m;
+        }
+        self.an.device_sn = self.device_sn.trim().to_string();
+        self.an.gpon_pw = self.gpon_pw.trim().to_string();
+        // GPON SN 允许输入 16 位 hex；不足则保持原值，免得手滑把身份写坏。
+        let hex: String = self
+            .gpon_sn
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        if hex.len() == 16 {
+            let mut sn = [0u8; 8];
+            for i in 0..8 {
+                if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                    sn[i] = b;
+                }
+            }
+            self.an.gpon_sn = sn;
+        }
+    }
+
+    /// 机型切换：三套布局互不通用（magic 不同），切过去只是换面板，
+    /// 已载入的数据各自留在 factory / hl202 / an 里，不会被覆盖。
+    fn switch_kind(&mut self, kind: Kind) {
+        self.kind = kind;
+        self.src_factory = None;
+        self.src_downlink = None;
+        self.gud.clear();
+        match kind {
+            Kind::Hm2004 => {
+                self.sync_from_factory();
+                self.msg = "已切换到主机 HM2004-DU".into();
+            }
+            Kind::Hl202 => {
+                self.sync_from_hl202();
+                self.msg = "已切换到从机 HL202-DU".into();
+            }
+            Kind::An4475 => {
+                self.sync_from_an();
+                self.msg = "已切换到 AN4475（需先打开 mtd9 备份才有出厂文件）".into();
+            }
+        }
     }
 
     fn save_image(&mut self, img: Vec<u8>, default_name: &str) {
@@ -156,10 +250,47 @@ impl Editor {
         );
     }
 
+    /// 载入 AN4475 的 mtd9 备份，或本工具生成的 1 MiB 容器。
+    ///
+    /// mtd9 不是裸分区而是整个 UBI 设备（25 MiB / 200 个 PEB），里面只有一个
+    /// 卷 `fhdata`，卷上是 UBIFS。解析见 `an4475::parse_mtd9`。
+    fn open_an(&mut self, bytes: &[u8], name: &str) {
+        let compact = an4475::is_compact(bytes);
+        let parsed = if compact {
+            an4475::parse_compact(bytes)
+        } else {
+            an4475::parse_mtd9(bytes)
+        };
+        match parsed {
+            Some(a) => {
+                let n = a.files.len();
+                let bosa = a.bosa.clone();
+                self.an = a;
+                self.kind = Kind::An4475;
+                self.sync_from_an();
+                self.src_factory = Some(name.to_string());
+                self.src_downlink = None;
+                self.gud.clear();
+                self.msg = format!(
+                    "已打开 AN4475 ({}): {name} · {n} 个出厂文件{}",
+                    if compact { "AN4-1MiB 容器" } else { "mtd9 UBI/UBIFS" },
+                    if bosa.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · BOSA {bosa}")
+                    }
+                );
+            }
+            None => self.msg = format!("已打开: {name} · 但没找到 AN4475 出厂数据（不是 mtd9？）"),
+        }
+    }
+
     /// Dispatch on content so the user can pick either file in the same dialog.
     fn open_auto(&mut self, bytes: &[u8], name: &str) {
         if import::looks_like_mtd13(bytes) {
             self.open_downlink(bytes, name);
+        } else if an4475::is_compact(bytes) || an4475::looks_like_volume(bytes) {
+            self.open_an(bytes, name);
         } else if hl202::is_compact(bytes) || hl202::looks_like_hl202_volume(bytes) {
             self.open_hl202(bytes, name);
         } else {
@@ -192,35 +323,24 @@ impl eframe::App for Editor {
         //    `Arc<Style>`，只改 ctx 对本帧无效（要等下一帧）。钉一下，首帧就不闪。
         ui.set_style(apply_light_theme(ui.ctx()));
 
-        // ---- 顶栏：标题 + 机型切换 + 动作 ----
+        // ---- 顶栏：标题 + 机型下拉 + 动作 ----
         ui.horizontal(|ui| {
             ui.heading("H3C Factory");
             ui.separator();
-            // 机型切换。两套布局互不相通（magic 不同），切换只是换面板，
-            // 已载入的数据各自保留在 factory / hl202 里，不会互相覆盖。
-            if ui
-                .selectable_label(self.kind == Kind::Hm2004, "主机 HM2004-DU")
-                .clicked()
-                && self.kind != Kind::Hm2004
-            {
-                self.kind = Kind::Hm2004;
-                self.src_factory = None;
-                self.src_downlink = None;
-                self.gud.clear();
-                self.sync_from_factory();
-                self.msg = "已切换到主机 HM2004-DU".into();
-            }
-            if ui
-                .selectable_label(self.kind == Kind::Hl202, "从机 HL202-DU")
-                .clicked()
-                && self.kind != Kind::Hl202
-            {
-                self.kind = Kind::Hl202;
-                self.src_factory = None;
-                self.src_downlink = None;
-                self.gud.clear();
-                self.sync_from_hl202();
-                self.msg = "已切换到从机 HL202-DU".into();
+            // 机型改成下拉框：三套布局互不相通（magic 不同），切换只是换面板，
+            // 已载入的数据各自保留在 factory / hl202 / an 里，不会互相覆盖。
+            ui.label("机型");
+            let mut picked = self.kind;
+            egui::ComboBox::from_id_salt("model_select")
+                .selected_text(self.kind.label())
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for k in Kind::ALL {
+                        ui.selectable_value(&mut picked, k, k.label());
+                    }
+                });
+            if picked != self.kind {
+                self.switch_kind(picked);
             }
         });
         // 标题 + 机型切换 + 8 个动作按钮挤在同一行，在 720 px 宽下会溢出 ——
@@ -246,6 +366,15 @@ impl eframe::App for Editor {
                             self.apply_to_hl202();
                             let img = self.hl202.encode_compact();
                             self.save_image(img, "factory-hl202-512k.bin");
+                        }
+                    }
+                    Kind::An4475 => {
+                        if ui.button("保存 1 MiB").clicked() {
+                            self.apply_to_an();
+                            match self.an.encode_compact() {
+                                Ok(img) => self.save_image(img, "factory-an4475-1mib.bin"),
+                                Err(e) => self.msg = format!("生成失败: {e}"),
+                            }
                         }
                     }
                 }
@@ -291,6 +420,21 @@ impl eframe::App for Editor {
                             }
                         }
                     }
+                    Kind::An4475 => {
+                        if ui.button("打开 mtd9").clicked() {
+                            if let Some(p) =
+                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_an(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
+                        }
+                    }
                     Kind::Hl202 => {
                         if ui.button("打开 mtd12").clicked() {
                             if let Some(p) =
@@ -319,6 +463,11 @@ impl eframe::App for Editor {
                             self.sync_from_hl202();
                             self.msg = "新建 HL202-DU Factory".into();
                         }
+                        Kind::An4475 => {
+                            self.an = An4475::new();
+                            self.sync_from_an();
+                            self.msg = "新建 AN4475（出厂文件需从 mtd9 备份导入）".into();
+                        }
                     }
                     self.src_factory = None;
                     self.src_downlink = None;
@@ -332,6 +481,7 @@ impl eframe::App for Editor {
         match self.kind {
             Kind::Hm2004 => self.ui_hm2004(ui),
             Kind::Hl202 => self.ui_hl202(ui),
+            Kind::An4475 => self.ui_an4475(ui),
         }
     }
 }
@@ -531,6 +681,181 @@ impl Editor {
         ui.weak("真实偏移: SN@0x14102c · magic@0x140000 · AL-MAC@gzip 0x80000 · BOB@0x1c0400 (0xE1) · EEPROM@0x4c000");
         ui.weak("GUD 字符串里只搬运 SN 和 MAC；SSID/密码/生产日期等留在原分区，不写入 512 KiB。");
     }
+
+    /// AN4475 面板：身份 + 9 个派生 MAC + 出厂文件清单。
+    ///
+    /// 与 H3C 两台机型的最大区别是「数据在文件里」：SN / MAC / GPON SN 全都在
+    /// `factory_conf` 这段 UCI 文本中，导出时由 `an4475::encode_compact` 回写，
+    /// 界面上的输入框就是这份文本的视图。
+    fn ui_an4475(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("an_sources")
+            .num_columns(2)
+            .spacing([16.0, 2.0])
+            .show(ui, |ui| {
+                ui.weak("mtd9 备份 / 1 MiB 镜像");
+                ui.monospace(self.src_factory.as_deref().unwrap_or("<未载入>"));
+                ui.end_row();
+                ui.weak("出厂文件");
+                ui.monospace(format!(
+                    "{} 个，原始 {} 字节",
+                    self.an.files.len(),
+                    self.an.payload_size()
+                ));
+                ui.end_row();
+            });
+        ui.separator();
+
+        egui::CollapsingHeader::new("当前镜像摘要")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.monospace(self.an.summary());
+            });
+        ui.separator();
+
+        ui.heading("身份信息");
+        const FIELD: f32 = 280.0;
+        ui.horizontal(|ui| {
+            ui.label(format!("设备序列号（{AN_SN_SIZE} 字符）"));
+            ui.add(egui::TextEdit::singleline(&mut self.device_sn).desired_width(FIELD));
+            if ui.button("按 MAC 生成").clicked() {
+                // 真机 SN = "F3200" + 基准 MAC 的 12 位 hex
+                // （F3200 + D49F2904E750 = F3200D49F2904E750），实测吻合。
+                let mac: String = self
+                    .an
+                    .base_mac
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect();
+                self.device_sn = format!("F3200{mac}");
+                self.an.device_sn = self.device_sn.clone();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("基准 MAC (base/br/pon)");
+            ui.add(egui::TextEdit::singleline(&mut self.label_mac).desired_width(FIELD));
+            if ui.button("随机").clicked() {
+                // 保留 OUI 只换后 3 字节：工厂换机不换厂商前缀。
+                let r = random_mac();
+                let old = self.an.base_mac;
+                let mut m = old;
+                m[3] = r[3];
+                m[4] = r[4];
+                m[5] = r[5];
+                self.an.base_mac = m;
+                self.label_mac = an4475::mac_to_string(&m);
+                // Wi-Fi 两位若还停在旧的派生值上，就跟着一起走；手改过的不动。
+                if self.an.wifi_2g4 == an4475::mac_add(&old, an4475::AN_WIFI_OFFSET_2G4) {
+                    self.an.wifi_2g4 = an4475::mac_add(&m, an4475::AN_WIFI_OFFSET_2G4);
+                    self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
+                }
+                if self.an.wifi_5g == an4475::mac_add(&old, an4475::AN_WIFI_OFFSET_5G) {
+                    self.an.wifi_5g = an4475::mac_add(&m, an4475::AN_WIFI_OFFSET_5G);
+                    self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("LAN 基址 MAC (eth1)");
+            ui.add(egui::TextEdit::singleline(&mut self.eth_mac).desired_width(FIELD));
+            if ui.button("随机").clicked() {
+                let r = random_mac();
+                let mut m = self.an.eth_mac;
+                m[3] = r[3];
+                m[4] = r[4];
+                m[5] = r[5];
+                self.an.eth_mac = m;
+                self.eth_mac = an4475::mac_to_string(&m);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("GPON SN（16 位 hex）");
+            ui.add(egui::TextEdit::singleline(&mut self.gpon_sn).desired_width(FIELD));
+        });
+        ui.horizontal(|ui| {
+            ui.label("GPON 密码（10 字符）");
+            ui.add(egui::TextEdit::singleline(&mut self.gpon_pw).desired_width(FIELD));
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Wi-Fi 2.4G MAC");
+            ui.add(egui::TextEdit::singleline(&mut self.wifi_2g4).desired_width(FIELD));
+            if ui.button("按基准 MAC 派生").clicked() {
+                let b = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
+                self.an.wifi_2g4 = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_2G4);
+                self.an.wifi_5g = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_5G);
+                self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
+                self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Wi-Fi 5G MAC");
+            ui.add(egui::TextEdit::singleline(&mut self.wifi_5g).desired_width(FIELD));
+        });
+        ui.weak(format!(
+            "写 EEPROM +{:#04X}/+{:#04X} 与 factory_conf 的 APMAC_1/APMAC_2；device id {}",
+            an4475::AN_EEPROM_MAC_2G4,
+            an4475::AN_EEPROM_MAC_5G,
+            if self.an.eeprom_id == 0 {
+                "<未载入>".to_string()
+            } else if self.an.eeprom_id == an4475::AN_MT7993_ID {
+                format!("0x{:04X} (MT7993)", self.an.eeprom_id)
+            } else {
+                format!("0x{:04X}（非 MT7993，请核对）", self.an.eeprom_id)
+            }
+        ));
+
+        ui.add_space(6.0);
+        let base = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
+        let eth = an4475::parse_mac(&self.eth_mac).unwrap_or(self.an.eth_mac);
+        ui.label("派生 MAC（随上面两个基址实时计算）");
+        egui::Grid::new("an_derived")
+            .num_columns(2)
+            .spacing([16.0, 3.0])
+            .show(ui, |ui| {
+                for (name, off) in [
+                    ("internetmac", 1u8),
+                    ("tr069mac", 2),
+                    ("voipmac", 3),
+                    ("priprotocolmac", 8),
+                ] {
+                    ui.label(name);
+                    ui.monospace(an4475::mac_to_string(&an4475::mac_add(&base, off)));
+                    ui.end_row();
+                }
+                for (i, name) in ["eth1mac", "eth2mac", "eth3mac", "eth4mac", "eth5mac"]
+                    .iter()
+                    .enumerate()
+                {
+                    ui.label(*name);
+                    ui.monospace(an4475::mac_to_string(&an4475::mac_add(&eth, i as u8)));
+                    ui.end_row();
+                }
+            });
+
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(format!("出厂文件（{} 个）", self.an.files.len()))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("an_files")
+                    .num_columns(2)
+                    .spacing([16.0, 2.0])
+                    .show(ui, |ui| {
+                        for f in &self.an.files {
+                            ui.monospace(f.name.as_str());
+                            ui.monospace(format!("{} 字节", f.data.len()));
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        ui.add_space(8.0);
+        ui.weak("mtd9 = 整个 UBI 设备（25 MiB / 200 个 128 KiB PEB），只有一个动态卷 fhdata（178 LEB），卷上是 UBIFS。");
+        ui.weak("1 MiB 镜像用专属 magic `AN4-1MiB`：头部固定偏移放身份，其余文件进 TOC + zlib 载荷。");
+        ui.weak("身份字段（SN / MAC / GPON SN / 密码）导出时会回写 factory_conf，保持文本与头部一致。");
+        ui.weak("导入时按 sqnum 取 UBIFS 每个 key 的最新副本；`.factory_conf.uci-*` 是写入中间态，自动跳过。");
+    }
 }
 
 /// 派生 MAC 只读表。两台机型规则相同（末字节 +1/+2/+4/+5），故共用一份绘制逻辑；
@@ -676,6 +1001,12 @@ fn main() -> eframe::Result {
                 kind: Kind::Hm2004,
                 factory: Factory::new(),
                 hl202: Hl202::new(),
+                an: An4475::new(),
+                eth_mac: String::new(),
+                gpon_sn: String::new(),
+                gpon_pw: String::new(),
+                wifi_2g4: String::new(),
+                wifi_5g: String::new(),
                 device_sn: String::new(),
                 label_mac: String::new(),
                 msg: "新建 Factory".to_string(),
