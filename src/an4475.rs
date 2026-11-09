@@ -195,7 +195,183 @@ pub const AN_WIFI_OFFSET_2G4: u8 = 6;
 pub const AN_WIFI_OFFSET_5G: u8 = 7;
 
 /// MT7993 的 device id。
+///
+/// 注意：开源 mt76 的 `mt7996` 驱动里这个值登记为 `MT7990_DEVICE_ID`（0x7993），
+/// `mt7996_check_eeprom()` 认它，所以 MT7993 在 Linux 下被当成 MT7990 驱动。
 pub const AN_MT7993_ID: u16 = 0x7993;
+
+// ---------------------------------------------------------------------------
+// mt76（开源驱动）视角的 EEPROM：定长 7 680 B
+// ---------------------------------------------------------------------------
+
+/// mt76 认的 EEPROM 长度 = `MT_EE_MAX + 1`。
+///
+/// 内核 `mt7996/eeprom.h`：`__MT_EE_MAX = 0x1dff`；
+/// `mt7996/mt7996.h`：`MT7996_EEPROM_SIZE 7680`。驱动无论走 efuse 还是
+/// 外部 EEPROM，都只按这个长度读；`/lib/firmware/mediatek/mt7996/mt7990_eeprom*.bin`
+/// 也必须是 7 680 B（不够长度直接判 `Invalid default bin size`）。
+///
+/// 厂商 `MT7993_EEPROM.bin` 是 1 353 728 B —— **同一份数据的超集**：
+/// 前 0x1000 与 mt76 模板基本逐字节相同（小 EE 头），0x1000–0x1DFF 起格式分叉，
+/// 0x1E00 之后 1.30 MB 是 mt_wifi 私有校准区，mt76 根本不读。
+pub const MT76_EE_SIZE: usize = 0x1E00;
+
+/// 厂商 EEPROM 与 mt76 视图「说同一种话」的前缀长度：0x000–0xFFF。
+///
+/// 这一段两边字段布局一致（芯片 ID / 版本 / 两个 MAC / WIFI_CONF / NIC_CONF /
+/// 各通道偏置），实测只差 10 个字节（都是补偿值），所以可以直接照搬。
+pub const MT76_HEAD_SIZE: usize = 0x1000;
+
+/// mt76 的 EEPROM 字段偏移（照抄内核 `mt7996/eeprom.h`，只列本工具用到的）。
+pub const MT_EE_CHIP_ID: usize = 0x000;
+pub const MT_EE_VERSION: usize = 0x002;
+pub const MT_EE_MAC_ADDR: usize = 0x004;
+pub const MT_EE_MAC_ADDR2: usize = 0x00a;
+pub const MT_EE_WIFI_CONF: usize = 0x190;
+pub const MT_EE_MAC_ADDR3: usize = 0x2c0;
+pub const MT_EE_TX0_POWER_2G: usize = 0x1300;
+pub const MT_EE_RATE_DELTA_2G: usize = 0x1400;
+
+/// 官方默认 bin：`MT7993_MT7976_EEPROM_BE3600_iPAiLNA.bin`
+/// （等同 `mediatek/mt7996/mt7990_eeprom_2i5i.bin`，内建 PA/LNA 变体）。
+///
+/// 选它的依据是实机 `WIFI_CONF+6/+7 = 0x08 0x08`，`MT_EE_WIFI_PA_LNA_CONFIG`
+/// 两位都是 0 = `MT7996_FEM_INT`；换成 ePA 那份（0x8B）会被
+/// `mt7996_eeprom_variant_valid()` 判为变体不符，直接回落到默认 bin。
+pub const MT76_DEFAULT_IPA: &[u8] = include_bytes!("../assets/mt7990_eeprom_2i5i.bin");
+/// 外置 PA/LNA 变体（`mt7990_eeprom_2e5e.bin`），仅供对照。
+pub const MT76_DEFAULT_EPA: &[u8] = include_bytes!("../assets/mt7990_eeprom_2e5e.bin");
+
+/// PA/LNA 变体：取 `WIFI_CONF+6` 的低 2 位（`MT_EE_WIFI_PA_LNA_CONFIG`）。
+pub fn mt76_pa_lna(eeprom: &[u8]) -> Option<u8> {
+    eeprom.get(MT_EE_WIFI_CONF + 6).map(|b| b & 0x3)
+}
+
+/// 把 `mt76_pa_lna()` 的两位翻成人话（对应内核 `MT7996_FEM_*`）。
+pub fn mt76_fem_name(v: u8) -> &'static str {
+    match v {
+        0 => "内建 PA/LNA（2i5i）",
+        3 => "外置 PA/LNA（2e5e）",
+        _ => "混合 / 未知",
+    }
+}
+
+/// 方式一：**原样截取**。直接把厂商 1 353 728 B 的前 7 680 B 当 mt76 EEPROM。
+///
+/// 保真但不一定可用：芯片 ID / 版本 / 两个 MAC / WIFI_CONF 都对，可
+/// 0x1000–0x1DFF 在厂商文件里是它自己的位图编码（几乎全是 0xFF 加上零星
+/// 清位），不是 mt76 要的 dBm 值。mt76 读到 `TX0_POWER = 0xFF` 会当成
+/// 目标功率 −1 dBm，发射功率会塌掉。只建议用来做字节级对照。
+pub fn mt76_carve(eeprom: &[u8]) -> Vec<u8> {
+    let mut out = vec![0xffu8; MT76_EE_SIZE];
+    let n = eeprom.len().min(MT76_EE_SIZE);
+    out[..n].copy_from_slice(&eeprom[..n]);
+    out
+}
+
+/// 方式二：**官方模板打底 + 注入实机身份**（推荐）。
+///
+/// 以 `template`（官方 7 680 B bin）为底，只把「必须跟着这台机器走」的字段
+/// 覆盖成实机值：
+///
+/// | 偏移 | 长度 | 含义 |
+/// |------|------|------|
+/// | 0x004 | 6 | 2.4G MAC（`MT_EE_MAC_ADDR`） |
+/// | 0x00A | 6 | 5G MAC（`MT_EE_MAC_ADDR2`） |
+/// | 0x190 | 6 | `WIFI_CONF`，决定频段数 / 收发链 / 空间流 |
+/// | 0x196 | 2 | PA/LNA 变体（`MT_EE_WIFI_PA_LNA_CONFIG`） |
+///
+/// 其余（0x1000 起的 byrate 功率表、RATE_DELTA）保留模板默认值 —— 那是
+/// mt76 能解释的编码，硬塞厂商位图只会更糟。
+pub fn mt76_from_template(template: &[u8], eeprom: &[u8]) -> Result<Vec<u8>, String> {
+    if template.len() < MT76_EE_SIZE {
+        return Err(format!(
+            "模板只有 {} 字节，不足 {MT76_EE_SIZE}",
+            template.len()
+        ));
+    }
+    if eeprom.len() < MT_EE_WIFI_CONF + 8 {
+        return Err(format!(
+            "实机 EEPROM 只有 {} 字节，读不到 WIFI_CONF",
+            eeprom.len()
+        ));
+    }
+    let mut out = template[..MT76_EE_SIZE].to_vec();
+    // 芯片 ID / 版本：实机与模板都是 0x7993 / 2，取实机值更稳（同芯片不同批次改过版本）。
+    out[MT_EE_CHIP_ID..MT_EE_CHIP_ID + 2].copy_from_slice(&eeprom[MT_EE_CHIP_ID..MT_EE_CHIP_ID + 2]);
+    out[MT_EE_VERSION..MT_EE_VERSION + 2].copy_from_slice(&eeprom[MT_EE_VERSION..MT_EE_VERSION + 2]);
+    out[MT_EE_MAC_ADDR..MT_EE_MAC_ADDR + 6]
+        .copy_from_slice(&eeprom[AN_EEPROM_MAC_2G4..AN_EEPROM_MAC_2G4 + 6]);
+    out[MT_EE_MAC_ADDR2..MT_EE_MAC_ADDR2 + 6]
+        .copy_from_slice(&eeprom[AN_EEPROM_MAC_5G..AN_EEPROM_MAC_5G + 6]);
+    out[MT_EE_WIFI_CONF..MT_EE_WIFI_CONF + 8]
+        .copy_from_slice(&eeprom[MT_EE_WIFI_CONF..MT_EE_WIFI_CONF + 8]);
+    Ok(out)
+}
+
+/// 一行字段对照，给界面表格用。
+pub struct Mt76Field {
+    pub off: usize,
+    pub name: &'static str,
+    /// 实机 1.35 MB 里的原始字节。
+    pub real: String,
+    /// 7 680 B 成品里的字节。
+    pub bin: String,
+    /// true = 成品采用了实机值；false = 保留模板默认。
+    pub injected: bool,
+}
+
+/// 生成「实机 vs 成品」的字段对照表（界面展示 + 回归断言用）。
+pub fn mt76_fields(eeprom: &[u8], bin: &[u8]) -> Vec<Mt76Field> {
+    const ROWS: [(usize, usize, &str); 8] = [
+        (MT_EE_CHIP_ID, 2, "芯片 ID"),
+        (MT_EE_VERSION, 2, "版本"),
+        (MT_EE_MAC_ADDR, 6, "2.4G MAC"),
+        (MT_EE_MAC_ADDR2, 6, "5G MAC"),
+        (MT_EE_WIFI_CONF, 6, "WIFI_CONF"),
+        (MT_EE_WIFI_CONF + 6, 2, "PA/LNA 变体"),
+        (MT_EE_MAC_ADDR3, 6, "6G MAC（本机无第三频段）"),
+        (MT_EE_TX0_POWER_2G, 1, "2.4G 目标功率"),
+    ];
+    ROWS.iter()
+        .map(|&(off, len, name)| {
+            let hex = |d: &[u8]| -> String {
+                d.get(off..off + len)
+                    .map(|s| s.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_else(|| "—".into())
+            };
+            let real = hex(eeprom);
+            let out = hex(bin);
+            Mt76Field {
+                off,
+                name,
+                injected: real == out,
+                real,
+                bin: out,
+            }
+        })
+        .collect()
+}
+
+/// 7 680 B 成品里「与实机不同」的字节数，按 0x1000 前缀 / 0x1000 之后分开统计。
+///
+/// 返回 `(前缀差异, 0x1000 起差异)`；用来在界面上直说：头部只有十来个字节对不上，
+/// 功率区则是整块换了编码。
+pub fn mt76_diff(eeprom: &[u8], bin: &[u8]) -> (usize, usize) {
+    let n = eeprom.len().min(bin.len()).min(MT76_EE_SIZE);
+    let mut head = 0;
+    let mut tail = 0;
+    for i in 0..n {
+        if eeprom[i] != bin[i] {
+            if i < MT76_HEAD_SIZE {
+                head += 1;
+            } else {
+                tail += 1;
+            }
+        }
+    }
+    (head, tail)
+}
 
 /// 网络侧派生表：(UCI 键名, 相对基准 MAC 的偏移)。
 const AN_DERIVED: [(&str, u8); 4] = [
@@ -982,5 +1158,46 @@ mod tests {
         let t2 = uci_set(t, "B", "9");
         assert_eq!(uci_get(&t2, "B").unwrap(), "9");
         assert_eq!(uci_get(&t2, "A").unwrap(), "1");
+    }
+
+    #[test]
+    fn mt76_template_is_sane() {
+        // 官方 bin 必须正好 7680 B，芯片 ID 是 0x7993，PA/LNA 变体为内建。
+        assert_eq!(MT76_DEFAULT_IPA.len(), MT76_EE_SIZE);
+        assert_eq!(MT76_DEFAULT_EPA.len(), MT76_EE_SIZE);
+        assert_eq!(
+            u16::from_le_bytes([MT76_DEFAULT_IPA[0], MT76_DEFAULT_IPA[1]]),
+            AN_MT7993_ID
+        );
+        assert_eq!(mt76_pa_lna(MT76_DEFAULT_IPA), Some(0));
+        assert_eq!(mt76_pa_lna(MT76_DEFAULT_EPA), Some(3));
+    }
+
+    #[test]
+    fn mt76_carve_and_inject() {
+        // 造一份「实机」EEPROM：芯片 ID + 版本 + 两个 MAC + WIFI_CONF。
+        let mut ee = vec![0u8; 0x100];
+        ee[0..2].copy_from_slice(&AN_MT7993_ID.to_le_bytes());
+        ee[2..4].copy_from_slice(&2u16.to_le_bytes());
+        ee[4..10].copy_from_slice(&[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x56]);
+        ee[0x0a..0x10].copy_from_slice(&[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x57]);
+        ee.extend_from_slice(&MT76_DEFAULT_IPA[0x100..MT76_EE_SIZE]); // 补到 7680
+        ee[MT_EE_WIFI_CONF..MT_EE_WIFI_CONF + 8]
+            .copy_from_slice(&MT76_DEFAULT_IPA[MT_EE_WIFI_CONF..MT_EE_WIFI_CONF + 8]);
+
+        let carved = mt76_carve(&ee);
+        assert_eq!(carved.len(), MT76_EE_SIZE);
+        assert_eq!(&carved[4..10], &[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x56]);
+
+        let bin = mt76_from_template(MT76_DEFAULT_IPA, &ee).unwrap();
+        assert_eq!(bin.len(), MT76_EE_SIZE);
+        assert_eq!(&bin[4..10], &[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x56]);
+        assert_eq!(&bin[0x0a..0x10], &[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x57]);
+        // 功率表必须还是模板原样（没被实机的位图覆盖）。
+        assert_eq!(
+            &bin[MT_EE_TX0_POWER_2G..MT_EE_TX0_POWER_2G + 16],
+            &MT76_DEFAULT_IPA[MT_EE_TX0_POWER_2G..MT_EE_TX0_POWER_2G + 16]
+        );
+        assert!(mt76_diff(&ee, &bin).0 <= 10);
     }
 }

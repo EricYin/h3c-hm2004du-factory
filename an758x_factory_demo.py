@@ -19,6 +19,7 @@ H3C HM2004-DU factory 工具 (Rust egui 编辑器的 Python 伴生版 / CLI)。
   python3 an758x_factory_demo.py parse --bin "G:/下载/H3C-HM2004-DU-TELNET备份/mtd14_reservearea.bin"
 """
 import argparse
+import os
 import struct
 import sys
 import zlib
@@ -788,6 +789,68 @@ def an4475_eeprom_set_macs(eeprom, mac_2g4, mac_5g):
     return bytes(buf)
 
 
+# ---- mt76（开源驱动）视角：定长 7 680 B ------------------------------------
+#
+# 内核 mt7996/eeprom.h 里 __MT_EE_MAX = 0x1DFF，mt7996.h 里
+# MT7996_EEPROM_SIZE = 7680 —— mt76 无论走 efuse 还是外部 EEPROM 都只读
+# 这么长，/lib/firmware 里的默认 bin 也必须是 7680 B。
+# 厂商 MT7993_EEPROM.bin 是 1 353 728 B，是同一份数据的超集：
+#   0x0000-0x0FFF  小 EE 头，两边布局一致（实测只差 10 字节）
+#   0x1000-0x1DFF  mt76 放 byrate 功率表 / RATE_DELTA；厂商放自己的位图
+#   0x1E00-0x14A7FF mt_wifi 私有校准区，mt76 不读
+MT76_EE_SIZE = 0x1E00
+MT76_HEAD_SIZE = 0x1000
+MT76_DEFAULT_IPA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "assets", "mt7990_eeprom_2i5i.bin")
+MT_EE_CHIP_ID = 0x000
+MT_EE_VERSION = 0x002
+MT_EE_MAC_ADDR = 0x004
+MT_EE_MAC_ADDR2 = 0x00A
+MT_EE_WIFI_CONF = 0x190
+MT_EE_MAC_ADDR3 = 0x2C0
+MT_EE_TX0_POWER_2G = 0x1300
+MT_EE_RATE_DELTA_2G = 0x1400
+MT76_FEM_NAMES = {0: "内建 PA/LNA（2i5i）", 3: "外置 PA/LNA（2e5e）"}
+
+
+def mt76_pa_lna(eeprom):
+    """PA/LNA 变体：WIFI_CONF+6 的低 2 位（MT_EE_WIFI_PA_LNA_CONFIG）。"""
+    if len(eeprom) < MT_EE_WIFI_CONF + 7:
+        return None
+    return eeprom[MT_EE_WIFI_CONF + 6] & 0x3
+
+
+def mt76_carve(eeprom):
+    """原样截取：厂商文件前 7 680 B。保真，但功率区是厂商编码，mt76 读不动。"""
+    out = bytearray(b"\xff" * MT76_EE_SIZE)
+    n = min(len(eeprom), MT76_EE_SIZE)
+    out[:n] = eeprom[:n]
+    return bytes(out)
+
+
+def mt76_from_template(template, eeprom):
+    """官方 7 680 B 模板打底，只覆盖芯片 ID/版本/两个 MAC/WIFI_CONF/PA-LNA。"""
+    if len(template) < MT76_EE_SIZE:
+        raise ValueError("模板只有 %d 字节，不足 %d" % (len(template), MT76_EE_SIZE))
+    if len(eeprom) < MT_EE_WIFI_CONF + 8:
+        raise ValueError("实机 EEPROM 只有 %d 字节，读不到 WIFI_CONF" % len(eeprom))
+    out = bytearray(template[:MT76_EE_SIZE])
+    out[MT_EE_CHIP_ID:MT_EE_CHIP_ID + 2] = eeprom[MT_EE_CHIP_ID:MT_EE_CHIP_ID + 2]
+    out[MT_EE_VERSION:MT_EE_VERSION + 2] = eeprom[MT_EE_VERSION:MT_EE_VERSION + 2]
+    out[MT_EE_MAC_ADDR:MT_EE_MAC_ADDR + 6] = eeprom[AN_EEPROM_MAC_2G4:AN_EEPROM_MAC_2G4 + 6]
+    out[MT_EE_MAC_ADDR2:MT_EE_MAC_ADDR2 + 6] = eeprom[AN_EEPROM_MAC_5G:AN_EEPROM_MAC_5G + 6]
+    out[MT_EE_WIFI_CONF:MT_EE_WIFI_CONF + 8] = eeprom[MT_EE_WIFI_CONF:MT_EE_WIFI_CONF + 8]
+    return bytes(out)
+
+
+def mt76_diff(eeprom, bin_):
+    """返回 (前缀差异字节数, 0x1000 起差异字节数)。"""
+    n = min(len(eeprom), len(bin_), MT76_EE_SIZE)
+    head = sum(1 for i in range(n) if i < MT76_HEAD_SIZE and eeprom[i] != bin_[i])
+    tail = sum(1 for i in range(n) if i >= MT76_HEAD_SIZE and eeprom[i] != bin_[i])
+    return head, tail
+
+
 # ---- UBIFS 读取 ----------------------------------------------------------
 
 def _ubifs_collect(data):
@@ -1161,6 +1224,12 @@ def main():
     a.add_argument("--wifi-24", help="2.4G Wi-Fi MAC（写 EEPROM +4 与 APMAC_1）")
     a.add_argument("--wifi-5g", help="5G Wi-Fi MAC（写 EEPROM +0x0A 与 APMAC_2）")
     a.add_argument("-o", "--out", help="输出 2 MiB 镜像路径")
+    a.add_argument("--export-mt76", metavar="BIN",
+                   help="额外导出 mt76 用的 7 680 B EEPROM（默认官方模板打底）")
+    a.add_argument("--mt76-carve", action="store_true",
+                   help="--export-mt76 改成原样截取（前 7 680 B，保真但功率区不可用）")
+    a.add_argument("--mt76-template", metavar="BIN",
+                   help="--export-mt76 打底用的模板（默认 assets/mt7990_eeprom_2i5i.bin）")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -1374,6 +1443,34 @@ def main():
             print("已写出 %d 字节 -> %s" % (len(img), args.out))
             print("  magic     : %r  载荷 %d 字节"
                   % (img[:8], int.from_bytes(img[0x18:0x1C], "little")))
+        if args.export_mt76:
+            ee = files.get(AN_WLAN_EEPROM) if files else None
+            if ee is None:
+                sys.exit("导出 mt76 EEPROM 需要 --bin 里有 %s" % AN_WLAN_EEPROM)
+            if args.mt76_carve:
+                bin_ = mt76_carve(ee)
+                mode = "原样截取"
+            else:
+                path = args.mt76_template or MT76_DEFAULT_IPA_PATH
+                try:
+                    tpl = open(path, "rb").read()
+                except OSError as exc:
+                    sys.exit("读不到 mt76 模板 %s: %s" % (path, exc))
+                bin_ = mt76_from_template(tpl, ee)
+                mode = "模板打底" if not args.mt76_template else "模板打底(%s)" % args.mt76_template
+            open(args.export_mt76, "wb").write(bin_)
+            head, tail = mt76_diff(ee, bin_)
+            pa = mt76_pa_lna(ee)
+            print("已写出 mt76 EEPROM %d 字节 -> %s（%s）"
+                  % (len(bin_), args.export_mt76, mode))
+            print("  源       : %d 字节" % len(ee))
+            print("  PA/LNA   : %s"
+                  % ("<读不到>" if pa is None
+                     else "0x%02X %s" % (pa, MT76_FEM_NAMES.get(pa, "混合/未知"))))
+            print("  0x0000-0x0FFF 差 %d 字节；0x1000 起差 %d 字节" % (head, tail))
+            print("  芯片 ID  : %s" % bin_[:2].hex(" ").upper())
+            print("  2.4G MAC : %s" % mac_to_string(bin_[MT_EE_MAC_ADDR:MT_EE_MAC_ADDR + 6]))
+            print("  5G   MAC : %s" % mac_to_string(bin_[MT_EE_MAC_ADDR2:MT_EE_MAC_ADDR2 + 6]))
     else:
         ap.print_help()
 

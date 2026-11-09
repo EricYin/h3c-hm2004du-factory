@@ -209,6 +209,7 @@ python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin
 
 # GUI 程序同样带一个无界面批处理入口（产线批量转换用）
 an758x-factory --export-an mtd9_factory.bin factory-an4475-2mib.bin
+an758x-factory --export-mt76 factory-an4475-2mib.bin mt7990_eeprom.bin
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
@@ -427,6 +428,42 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 
 > 压缩实现差异：Rust 侧用 `miniz_oxide`、Python 侧用 `zlib`，同一份输入打出来的**压缩字节可能不同**（本次实测载荷 218 787 vs 210 969 字节），**解压后的文件内容完全一致**。跨语言比对请比内容，不要比整个镜像的 MD5。
 
+### mt76 / OpenWrt：7 680 B 的 EEPROM 视图
+
+厂商那份 `MT7993_EEPROM.bin` 是 **1 353 728 B**，而内核 mt76 的 `mt7996` 驱动只要 **7 680 B** —— 不是谁压缩了谁，而是**同一份数据的两个视图**：
+
+| 段 | 长度 | 厂商 1.35 MB 里是什么 | mt76 里是什么 |
+|---|---|---|---|
+| `0x0000–0x0FFF` | 4 096 | 小 EE 头：芯片 ID / 版本 / 两个 MAC / `WIFI_CONF` / 通道偏置 | **同一套布局**，实测仅差 10 字节 |
+| `0x1000–0x1DFF` | 3 584 | 厂商自己的位图编码（近 3 000 字节是 `0xFF` 加零星清位） | byrate 功率表 + `RATE_DELTA`，正常 dBm 值 |
+| `0x1E00–0x14A7FF` | 1 346 048 | `mt_wifi` 私有校准区 | **不存在**，驱动不读 |
+
+对齐依据是内核头文件：`mt7996/eeprom.h` 里 `__MT_EE_MAX = 0x1dff`，`mt7996.h` 里 `MT7996_EEPROM_SIZE = 7680`、`MT7996_EEPROM_BLOCK_SIZE = 16`；驱动无论走 efuse 还是外部 EEPROM，都只按 7 680 B 读，`/lib/firmware/mediatek/mt7996/mt7990_eeprom*.bin` 长度不足直接 `Invalid default bin size`。
+
+> 顺带一个坑：`0x7993` 在开源驱动里登记成 **`MT7990_DEVICE_ID`**（`mt7996_check_eeprom()` 认它），所以 MT7993 在 Linux 下是当 MT7990 跑的，默认 bin 名也就成了 `mt7990_eeprom*.bin`。
+
+工具给两种成品（界面「mt76 / OpenWrt EEPROM（7 680 B）」折叠区，或命令行）：
+
+| 方式 | 做法 | 适用 |
+|---|---|---|
+| **模板打底**（默认） | 官方 `mt7990_eeprom_2i5i.bin` 打底，只覆盖 `0x004`/`0x00A` 的 MAC、`0x190` 的 6 字节 `WIFI_CONF`、`0x196` 的 PA/LNA | 给 mt76 用，功率表是驱动能解释的编码 |
+| **原样截取** | 直接取厂商文件前 7 680 B | 只做字节级对照；`0x1000` 起是位图，mt76 会把 `TX0_POWER = 0xFF` 读成 −1 dBm |
+
+模板选 **iPA/LNA** 那份是有依据的：实机 `WIFI_CONF+6/+7 = 08 08`，`MT_EE_WIFI_PA_LNA_CONFIG` 两位为 0 = `MT7996_FEM_INT`；换成 ePA 那份（`8B 8B`，`FEM_EXT`）会被 `mt7996_eeprom_variant_valid()` 判变体不符，直接回落默认 bin。两份模板都在 `assets/` 里，`--mt76-template` 可换。
+
+```bash
+# 从 2 MiB 容器（或 mtd9 备份、或裸的 1.35 MB EEPROM）导出 7 680 B
+./an758x-factory --export-mt76 factory-an4475-2mib.bin mt7990_eeprom.bin
+# 原样截取
+./an758x-factory --export-mt76 factory-an4475-2mib.bin mt7990_eeprom-carve.bin carve
+# Python 侧等价
+python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin --export-mt76 mt7990_eeprom.bin
+```
+
+装到设备上：`/lib/firmware/mediatek/mt7996/mt7990_eeprom_2i5i.bin`（内建 PA/LNA 变体）。
+
+> 本机实测（AN4475 真机 EEPROM）：模板打底的产物与官方 `MT7993_MT7976_EEPROM_BE3600_iPAiLNA.bin` **逐字节相同**（MD5 `74abc9a1…`）—— 因为产线连 Wi-Fi MAC 都没写，头段本来就是芯片厂原样。换言之这份板子的默认 bin 不用改，只有真要给每台机器不同 MAC 时才需要注入。
+
 ## 目录结构
 
 ```
@@ -444,6 +481,9 @@ an758x-factory/
 │   ├── hl202.rs     # HL202-DU 布局常量 + Hl202 + encode_compact（512 KiB）
 │   ├── an4475.rs    # AN4475：mtd9 UBI/UBIFS 解析 + 2 MiB 容器
 │   └── import.rs    # 解析真实 factory 卷 / mtd13 UBIFS
+├── assets/
+│   ├── mt7990_eeprom_2i5i.bin      # 官方默认 bin，内建 PA/LNA（7680 B，实机用这份）
+│   └── mt7990_eeprom_2e5e.bin      # 官方默认 bin，外置 PA/LNA（7680 B，对照用）
 ├── an758x_factory_demo.py
 └── examples/
     ├── factory-h3c-demo.bin          # 主机 1 MiB 示例

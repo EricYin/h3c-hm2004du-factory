@@ -911,6 +911,127 @@ impl Editor {
         ));
 
         ui.add_space(6.0);
+        // mt76 只需要 7 680 B，厂商文件却是 1 353 728 B —— 这个折叠区专门解释
+        // 两者关系并给出成品，省得用户自己在 1.3 MB 里找偏移。
+        egui::CollapsingHeader::new("mt76 / OpenWrt EEPROM（7 680 B）")
+            .default_open(false)
+            .show(ui, |ui| {
+                // Some(true) = 模板打底，Some(false) = 原样截取。
+                let mut action: Option<bool> = None;
+                // 只在展开时借用，不 clone 1.3 MB。
+                let ee = self
+                    .an
+                    .files
+                    .iter()
+                    .find(|f| f.name == an4475::AN_EEPROM)
+                    .map(|f| f.data.as_slice());
+                match ee {
+                    None => {
+                        ui.weak("未载入 MT7993_EEPROM.bin，无法生成。");
+                    }
+                    Some(ee) => {
+                        let real = match an4475::mt76_pa_lna(ee) {
+                            Some(v) => format!("0x{v:02X}（{}）", an4475::mt76_fem_name(v)),
+                            None => "读不到".to_string(),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak("厂商文件");
+                            ui.monospace(format!("{} B", ee.len()));
+                            ui.weak("→ mt76 视图");
+                            ui.monospace(format!("{} B = 0x{:04X}", an4475::MT76_EE_SIZE, an4475::MT76_EE_SIZE));
+                            ui.weak("PA/LNA");
+                            ui.monospace(real);
+                        });
+                        ui.add_space(4.0);
+                        // 两种成品的字段对照：左边实机值，右边 7 680 B 里的值。
+                        let bin = an4475::mt76_from_template(an4475::MT76_DEFAULT_IPA, ee)
+                            .unwrap_or_else(|_| an4475::mt76_carve(ee));
+                        let (head, tail) = an4475::mt76_diff(ee, &bin);
+                        egui::Grid::new("an_mt76_fields")
+                            .num_columns(3)
+                            .spacing([14.0, 3.0])
+                            .show(ui, |ui| {
+                                ui.weak("字段");
+                                ui.weak("实机 1.35 MB");
+                                ui.weak("成品 7 680 B");
+                                ui.end_row();
+                                for f in an4475::mt76_fields(ee, &bin) {
+                                    ui.monospace(format!("{:04X} {}", f.off, f.name));
+                                    ui.monospace(f.real);
+                                    ui.monospace(if f.injected {
+                                        f.bin
+                                    } else {
+                                        format!("{}  ← 保持模板", f.bin)
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.weak(format!(
+                            "0x0000–0x0FFF 与官方模板差 {head} 字节；0x1000–0x1DFF 差 {tail} 字节（厂商位图编码，未采纳）。"
+                        ));
+                        ui.weak("0x1E00–0x14A7FF 是 mt_wifi 私有校准区，mt76 不读，成品里没有。");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("导出 7 680 B（模板打底，推荐）")
+                                .on_hover_text(
+                                    "官方 mt7990_eeprom_2i5i.bin 打底，只覆盖芯片 ID/版本/MAC/WIFI_CONF",
+                                )
+                                .clicked()
+                            {
+                                action = Some(true);
+                            }
+                            if ui
+                                .button("导出 7 680 B（原样截取）")
+                                .on_hover_text("直接截厂商文件前 7 680 B，字节保真但功率区不可用")
+                                .clicked()
+                            {
+                                action = Some(false);
+                            }
+                        });
+                    }
+                }
+                // 借用结束后再写 self.msg / 落盘。
+                if let Some(by_template) = action {
+                    if let Some(ee) = self
+                        .an
+                        .files
+                        .iter()
+                        .find(|f| f.name == an4475::AN_EEPROM)
+                        .map(|f| f.data.clone())
+                    {
+                        let out = if by_template {
+                            an4475::mt76_from_template(an4475::MT76_DEFAULT_IPA, &ee)
+                        } else {
+                            Ok(an4475::mt76_carve(&ee))
+                        };
+                        match out {
+                            Ok(bin) => {
+                                if let Some(p) = FileDialog::new()
+                                    .set_file_name("mt7990_eeprom.bin")
+                                    .save_file()
+                                {
+                                    match std::fs::write(&p, &bin) {
+                                        Ok(_) => {
+                                            self.msg = format!(
+                                                "已导出 mt76 EEPROM {} 字节（{}）-> {}",
+                                                bin.len(),
+                                                if by_template { "模板打底" } else { "原样截取" },
+                                                p.display()
+                                            )
+                                        }
+                                        Err(e) => self.msg = format!("导出失败: {e}"),
+                                    }
+                                }
+                            }
+                            Err(e) => self.msg = format!("生成失败: {e}"),
+                        }
+                    }
+                }
+            });
+
+        ui.add_space(6.0);
         let base = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
         let eth = an4475::parse_mac(&self.eth_mac).unwrap_or(self.an.eth_mac);
         ui.label("派生 MAC（随上面两个基址实时计算）");
@@ -1149,10 +1270,79 @@ fn export_an_cli(input: &str, output: &str) {
     }
 }
 
+/// 无界面批处理：`an758x-factory --export-mt76 <输入> <输出> [carve]`。
+///
+/// 输入可以是 mtd9 备份 / 1–2 MiB 容器，也可以直接是那份 1 353 728 B 的
+/// `MT7993_EEPROM.bin`（按首两字节 0x7993 认）。输出恒为 7 680 B。
+/// 默认「模板打底」，末尾加 `carve` 改成「原样截取」。
+fn export_mt76_cli(input: &str, output: &str, carve: bool) {
+    let bytes = match std::fs::read(input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取失败 {input}: {e}");
+            return;
+        }
+    };
+    let eeprom: Vec<u8> = if an4475::is_compact(&bytes) {
+        match an4475::parse_compact(&bytes)
+            .and_then(|a| a.files.into_iter().find(|f| f.name == an4475::AN_EEPROM))
+        {
+            Some(f) => f.data,
+            None => {
+                eprintln!("容器里没有 {}", an4475::AN_EEPROM);
+                return;
+            }
+        }
+    } else if bytes.len() > 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == an4475::AN_MT7993_ID {
+        // 已经是一份 EEPROM（1.35 MB 或 7 680 B 都认）。
+        bytes
+    } else {
+        match an4475::parse_mtd9(&bytes)
+            .and_then(|a| a.files.into_iter().find(|f| f.name == an4475::AN_EEPROM))
+        {
+            Some(f) => f.data,
+            None => {
+                eprintln!("无法识别输入（mtd9 / AN4-* 容器 / MT7993_EEPROM.bin 都不是）: {input}");
+                return;
+            }
+        }
+    };
+    let bin = if carve {
+        an4475::mt76_carve(&eeprom)
+    } else {
+        match an4475::mt76_from_template(an4475::MT76_DEFAULT_IPA, &eeprom) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("生成失败: {e}");
+                return;
+            }
+        }
+    };
+    match std::fs::write(output, &bin) {
+        Ok(_) => {
+            let (head, tail) = an4475::mt76_diff(&eeprom, &bin);
+            println!(
+                "已写出 {} 字节 -> {output}（{}；源 {} 字节，PA/LNA {}，0x0000-0x0FFF 差 {} B，0x1000 起差 {} B）",
+                bin.len(),
+                if carve { "原样截取" } else { "模板打底" },
+                eeprom.len(),
+                an4475::mt76_pa_lna(&eeprom).map_or("?".to_string(), |v| format!("0x{v:02X} {}", an4475::mt76_fem_name(v))),
+                head,
+                tail
+            );
+        }
+        Err(e) => eprintln!("写入失败 {output}: {e}"),
+    }
+}
+
 fn main() -> eframe::Result {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() == 4 && argv[1] == "--export-an" {
         export_an_cli(&argv[2], &argv[3]);
+        return Ok(());
+    }
+    if argv.len() >= 4 && argv[1] == "--export-mt76" {
+        export_mt76_cli(&argv[2], &argv[3], argv.len() > 4 && argv[4] == "carve");
         return Ok(());
     }
     let options = eframe::NativeOptions {
@@ -1163,7 +1353,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.5.0",
+        "AN758X Factory 编辑器 v0.6.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
