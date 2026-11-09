@@ -62,8 +62,9 @@
 //! 0x18A800      EEPROM 结束
 //! 0x1A0000      11 张 PON 校准表的直读区（每张 4 KiB 槽，原样不压缩）
 //!               槽序见 AN_CAL_TABLES：0x1A0000 + 槽号 × 0x1000
-//! 0x1AB000      直读区结束
-//! ---------- 其余至 0x200000 全 0xFF ----------
+//! 0x1AB000      mt76 直读槽：7 680 B，由 1.35 MB 模板打底派生，给 OpenWrt 用
+//! 0x1ACE00      直读区结束
+//! ---------- 其余至 0x200000 全 0xFF（332 KiB）----------
 //! ```
 //!
 //! ## MAC 派生规律（真机实证）
@@ -178,10 +179,36 @@ pub fn cal_offset(name: &str) -> Option<usize> {
         .map(|i| AN_CAL_FIXED_OFF + i * AN_CAL_SLOT)
 }
 
+/// **mt76 直读槽**起点：紧接 11 张 PON 校准表之后（`0x1AB000`）。
+///
+/// 容器里那 1.35 MB 是原厂 `mt_wifi` 的格式，mt76 只认其中前 7 680 B、且
+/// 功率段编码不同。为了「一块 factory 同时喂饱两套固件」，打包时在这里再放
+/// 一份用官方模板打底派生出来的 7 680 B：OpenWrt 的 DTS 直接把 nvmem 指到
+/// `0x1AB000`，长度 `0x1E00` 即可，不用再跑一次转换工具。
+///
+/// 尾部到 `0x200000` 还剩 340 KiB，放得下且不影响任何既有偏移。
+pub const AN_MT76_FIXED_OFF: usize = AN_CAL_FIXED_OFF + AN_CAL_TABLES.len() * AN_CAL_SLOT;
+/// mt76 EEPROM 的固定长度（与 `MT76_EE_SIZE` 同值，单独命名便于出现在布局表里）。
+pub const AN_MT76_SIZE: usize = 0x1E00;
+
+/// 从容器尾部取出随包存放的 mt76 EEPROM；没有（旧镜像）时返回 `None`。
+pub fn compact_mt76(data: &[u8]) -> Option<&[u8]> {
+    let s = data.get(AN_MT76_FIXED_OFF..AN_MT76_FIXED_OFF + AN_MT76_SIZE)?;
+    // 尾部原本是 0xFF；校验 chip id + 至少有一个非 0xFF 字节，避免把空白当数据。
+    if s.len() == AN_MT76_SIZE
+        && s.starts_with(&AN_MT7990_ID.to_le_bytes())
+        && s.iter().any(|b| *b != 0xff)
+    {
+        Some(s)
+    } else {
+        None
+    }
+}
+
 // Wi-Fi EEPROM 头很短：device id + 版本 + 两个 MAC，0x10..0x190 全 0，
 // 0x190 起才是射频校准表。出厂值仍是芯片厂默认（2.4G/5G 分别
 // 00:0C:43:26:60:10 / :11，00:0C:43 是 MediaTek 的 OUI），产线没写这两位。
-pub const AN_EEPROM_DEVICE_ID: usize = 0x00; // u16 LE，MT7993 = 0x7993
+pub const AN_EEPROM_DEVICE_ID: usize = 0x00; // u16 LE，MT7990AN = 0x7993
 pub const AN_EEPROM_VERSION: usize = 0x02; // u16 LE，实测 2
 pub const AN_EEPROM_MAC_2G4: usize = 0x04;
 pub const AN_EEPROM_MAC_5G: usize = 0x0a;
@@ -194,11 +221,15 @@ pub const AN_APMAC_5G: &str = "APMAC_2";
 pub const AN_WIFI_OFFSET_2G4: u8 = 6;
 pub const AN_WIFI_OFFSET_5G: u8 = 7;
 
-/// MT7993 的 device id。
+/// 本机 Wi-Fi 方案的数字基带是 **MT7990AN**（配套射频前端 MT7976CN，双频
+/// 2.4G/5G、无 6G），device id 即 `0x7993`。
 ///
-/// 注意：开源 mt76 的 `mt7996` 驱动里这个值登记为 `MT7990_DEVICE_ID`（0x7993），
-/// `mt7996_check_eeprom()` 认它，所以 MT7993 在 Linux 下被当成 MT7990 驱动。
-pub const AN_MT7993_ID: u16 = 0x7993;
+/// 开源 mt76 的 `mt7996` 驱动把 `0x7993` 登记为 `MT7990_DEVICE_ID`，
+/// `mt7996_check_eeprom()` 认它 —— 所以 Linux 下按 MT7990 跑，默认 bin 名
+/// 是 `mt7990_eeprom_2i5i.bin`，不是 `mt7996_*`。
+///
+/// 厂商文件名 `MT7993_EEPROM.bin` 沿用出厂的命名，与实际芯片型号无关。
+pub const AN_MT7990_ID: u16 = 0x7993;
 
 // ---------------------------------------------------------------------------
 // mt76（开源驱动）视角的 EEPROM：定长 7 680 B
@@ -405,7 +436,7 @@ pub struct An4475 {
     pub wifi_2g4: [u8; 6],
     /// Wi-Fi 5G MAC，写 EEPROM +0x0A 与 `APMAC_2`。
     pub wifi_5g: [u8; 6],
-    /// Wi-Fi EEPROM 头里的 device id（MT7993 = 0x7993，只读展示）。
+    /// Wi-Fi EEPROM 头里的 device id（MT7990AN = 0x7993，只读展示）。
     pub eeprom_id: u16,
     pub vendor: String,
     /// BOSA 型号，来自 `olt_bosa_info` 的 `olt_bosa_id`（真机 WTD01）。
@@ -481,10 +512,10 @@ impl An4475 {
             s.push_str(&format!(
                 "Wi-Fi EEPROM: device id 0x{:04X}{}\n",
                 self.eeprom_id,
-                if self.eeprom_id == AN_MT7993_ID {
+                if self.eeprom_id == AN_MT7990_ID {
                     ""
                 } else {
-                    "（非 MT7993）"
+                    "（非 MT7990AN）"
                 }
             ));
         }
@@ -609,6 +640,22 @@ impl An4475 {
             put_u32(&mut img, ent + AN_NAME_MAX + 8, blob.len() as u32);
             img[ent + AN_NAME_MAX + 12] = compr;
         }
+        // 尾部再塞一份 mt76 能直接加载的 7 680 B：拿上面写好的那份 1.35 MB
+        // 做模板打底（只取 MAC / WIFI_CONF / PA-LNA，功率表用官方值），
+        // 这样 OpenWrt 侧 nvmem 指到 0x1AB000 就能用，不必现场转换。
+        if let Some(raw) = files.get(AN_EEPROM) {
+            let bin = mt76_from_template(MT76_DEFAULT_IPA, raw)?;
+            let end = AN_MT76_FIXED_OFF + bin.len();
+            if end > AN_COMPACT_SIZE {
+                return Err(format!(
+                    "mt76 槽 0x{:06X} 放不下 {AN_MT76_SIZE} 字节",
+                    AN_MT76_FIXED_OFF
+                ));
+            }
+            img[AN_MT76_FIXED_OFF..end].copy_from_slice(&bin);
+            max_end = max_end.max(end);
+        }
+
         // 载荷长度取「最远写入位置」，固定区的 EEPROM 也算在内。
         put_u32(&mut img, 0x18, (max_end - AN_PAYLOAD_OFF) as u32);
         Ok(img)
@@ -1152,6 +1199,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_carries_mt76_slot() {
+        // 放一份 EEPROM 进去，打包后尾部应出现 7 680 B 的 mt76 副本。
+        let mut a = An4475::new();
+        a.files.push(AnFile {
+            name: AN_EEPROM.to_string(),
+            data: MT76_DEFAULT_IPA.to_vec(),
+        });
+        let img = a.encode_compact().unwrap();
+        let slot = compact_mt76(&img).expect("尾部应带 mt76 槽");
+        assert_eq!(slot.len(), AN_MT76_SIZE);
+        assert_eq!(slot, MT76_DEFAULT_IPA);
+        assert!(AN_MT76_FIXED_OFF + AN_MT76_SIZE <= AN_COMPACT_SIZE);
+        // 载荷长度要覆盖到槽尾。
+        let payload = u32::from_le_bytes([img[0x18], img[0x19], img[0x1a], img[0x1b]]) as usize;
+        assert_eq!(payload, AN_MT76_FIXED_OFF + AN_MT76_SIZE - AN_PAYLOAD_OFF);
+
+        // 没有 EEPROM 就不该有槽（尾部保持 0xFF）。
+        let b = An4475::new();
+        let img2 = b.encode_compact().unwrap();
+        assert!(compact_mt76(&img2).is_none());
+    }
+
+    #[test]
     fn uci_roundtrip() {
         let t = "config key 'A'\n\toption value '1'\n\nconfig key 'B'\n\toption value '2'\n";
         assert_eq!(uci_get(t, "B").unwrap(), "2");
@@ -1167,7 +1237,7 @@ mod tests {
         assert_eq!(MT76_DEFAULT_EPA.len(), MT76_EE_SIZE);
         assert_eq!(
             u16::from_le_bytes([MT76_DEFAULT_IPA[0], MT76_DEFAULT_IPA[1]]),
-            AN_MT7993_ID
+            AN_MT7990_ID
         );
         assert_eq!(mt76_pa_lna(MT76_DEFAULT_IPA), Some(0));
         assert_eq!(mt76_pa_lna(MT76_DEFAULT_EPA), Some(3));
@@ -1177,7 +1247,7 @@ mod tests {
     fn mt76_carve_and_inject() {
         // 造一份「实机」EEPROM：芯片 ID + 版本 + 两个 MAC + WIFI_CONF。
         let mut ee = vec![0u8; 0x100];
-        ee[0..2].copy_from_slice(&AN_MT7993_ID.to_le_bytes());
+        ee[0..2].copy_from_slice(&AN_MT7990_ID.to_le_bytes());
         ee[2..4].copy_from_slice(&2u16.to_le_bytes());
         ee[4..10].copy_from_slice(&[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x56]);
         ee[0x0a..0x10].copy_from_slice(&[0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x57]);

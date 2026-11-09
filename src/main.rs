@@ -903,10 +903,10 @@ impl Editor {
             an4475::AN_EEPROM_MAC_5G,
             if self.an.eeprom_id == 0 {
                 "<未载入>".to_string()
-            } else if self.an.eeprom_id == an4475::AN_MT7993_ID {
-                format!("0x{:04X} (MT7993)", self.an.eeprom_id)
+            } else if self.an.eeprom_id == an4475::AN_MT7990_ID {
+                format!("0x{:04X} (MT7990AN)", self.an.eeprom_id)
             } else {
-                format!("0x{:04X}（非 MT7993，请核对）", self.an.eeprom_id)
+                format!("0x{:04X}（非 MT7990AN，请核对）", self.an.eeprom_id)
             }
         ));
 
@@ -971,6 +971,12 @@ impl Editor {
                             "0x0000–0x0FFF 与官方模板差 {head} 字节；0x1000–0x1DFF 差 {tail} 字节（厂商位图编码，未采纳）。"
                         ));
                         ui.weak("0x1E00–0x14A7FF 是 mt_wifi 私有校准区，mt76 不读，成品里没有。");
+                        ui.add_space(3.0);
+                        ui.weak(format!(
+                            "保存 2 MiB 镜像时会自动在 0x{:06X} 附带一份同样的 7 680 B（模板打底），\
+                             OpenWrt 的 nvmem 直接指到这个偏移即可，原厂 1.35 MB 不受影响。",
+                            an4475::AN_MT76_FIXED_OFF
+                        ));
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             if ui
@@ -1092,9 +1098,9 @@ impl Editor {
 
         ui.add_space(8.0);
         ui.weak("mtd9 = 整个 UBI 设备（25 MiB / 200 个 128 KiB PEB），只有一个动态卷 fhdata（178 LEB），卷上是 UBIFS。");
-        ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，EEPROM 与 11 张 PON 校准表放固定槽原样存，只有 9 个配置文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
+        ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，EEPROM、11 张 PON 校准表与 mt76 槽放固定偏移原样存，只有 9 个配置文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
         ui.weak(format!(
-            "Wi-Fi 校准（MT7993_EEPROM.bin，1 353 728 字节）固定放在 0x{:06X}、原样不压缩，可直接用 hex 工具打开；设备 ID 应为 0x7993。",
+            "Wi-Fi 校准（MT7993_EEPROM.bin，1 353 728 字节）固定放在 0x{:06X}、原样不压缩，可直接用 hex 工具打开；设备 ID 应为 0x7993（MT7990AN）。",
             an4475::AN_EEPROM_FIXED_OFF
         ));
         ui.weak(format!(
@@ -1103,6 +1109,11 @@ impl Editor {
         ));
         ui.weak("  +0x0000 10ge_asym / +0x1000 10ge_sym / +0x2000 xg / +0x3000 xgs / +0x4000 table / +0x5000 olt_table");
         ui.weak("  +0x6000 olt_bosa_apd_WTD01 / +0x7000 olt_bosa_apd_YS01 / +0x8000 olt_bosa_info / +0x9000 olt_bosa_rssi / +0xA000 LanOpticTxCalib");
+        ui.weak(format!(
+            "mt76 直读槽 0x{:06X} 起 {} 字节：打包时由 1.35 MB 自动派生（模板打底），OpenWrt 的 DTS nvmem 指到这里即可；槽后到 0x200000 仍剩 332 KiB。",
+            an4475::AN_MT76_FIXED_OFF,
+            an4475::AN_MT76_SIZE
+        ));
         ui.weak("身份字段（SN / MAC / GPON SN / 密码）导出时会回写 factory_conf，保持文本与头部一致。");
         ui.weak("导入时按 sqnum 取 UBIFS 每个 key 的最新副本；`.factory_conf.uci-*` 是写入中间态，自动跳过。");
     }
@@ -1283,6 +1294,20 @@ fn export_mt76_cli(input: &str, output: &str, carve: bool) {
             return;
         }
     };
+    // 新镜像尾部自带 mt76 槽，直接取用，省一次转换（结果与模板打底逐字节相同）。
+    if !carve {
+        if let Some(slot) = an4475::compact_mt76(&bytes) {
+            match std::fs::write(output, slot) {
+                Ok(_) => println!(
+                    "已写出 {} 字节 -> {output}（取自容器 0x{:06X} 的 mt76 槽）",
+                    slot.len(),
+                    an4475::AN_MT76_FIXED_OFF
+                ),
+                Err(e) => eprintln!("写入失败 {output}: {e}"),
+            }
+            return;
+        }
+    }
     let eeprom: Vec<u8> = if an4475::is_compact(&bytes) {
         match an4475::parse_compact(&bytes)
             .and_then(|a| a.files.into_iter().find(|f| f.name == an4475::AN_EEPROM))
@@ -1293,7 +1318,7 @@ fn export_mt76_cli(input: &str, output: &str, carve: bool) {
                 return;
             }
         }
-    } else if bytes.len() > 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == an4475::AN_MT7993_ID {
+    } else if bytes.len() > 2 && u16::from_le_bytes([bytes[0], bytes[1]]) == an4475::AN_MT7990_ID {
         // 已经是一份 EEPROM（1.35 MB 或 7 680 B 都认）。
         bytes
     } else {

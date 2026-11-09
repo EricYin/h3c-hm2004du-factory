@@ -681,6 +681,21 @@ def cal_offset(name):
     if name in AN_CAL_TABLES:
         return AN_CAL_FIXED_OFF + AN_CAL_TABLES.index(name) * AN_CAL_SLOT
     return None
+
+
+# mt76 直读槽：紧接 11 张 PON 校准表之后（0x1AB000）。
+AN_MT76_FIXED_OFF = AN_CAL_FIXED_OFF + len(AN_CAL_TABLES) * AN_CAL_SLOT
+AN_MT76_SIZE = 0x1E00
+
+
+def compact_mt76(data):
+    """从容器尾部取出随包存放的 mt76 EEPROM；旧镜像返回 None。"""
+    if len(data) < AN_MT76_FIXED_OFF + AN_MT76_SIZE:
+        return None
+    s = data[AN_MT76_FIXED_OFF:AN_MT76_FIXED_OFF + AN_MT76_SIZE]
+    if s[:2] == b"\x93\x79" and any(b != 0xFF for b in s):
+        return bytes(s)
+    return None
 AN_COMPACT_VERSION = 1
 AN_TOC_OFF = 0x1000
 AN_PAYLOAD_OFF = 0x2000
@@ -722,7 +737,7 @@ AN_MAIN_CONF = "factory_conf"
 # （2.4G/5G 分别 00:0C:43:26:60:10 / :11，00:0C:43 是 MediaTek 的 OUI），
 # 说明产线没写这两位，得由本工具补。
 AN_WLAN_EEPROM = "MT7993_EEPROM.bin"
-AN_EEPROM_DEVICE_ID = 0x00          # u16 LE，MT7993 = 0x7993
+AN_EEPROM_DEVICE_ID = 0x00          # u16 LE，MT7990AN = 0x7993
 AN_EEPROM_VERSION = 0x02            # u16 LE，实测 2
 AN_EEPROM_MAC_2G4 = 0x04            # 6 字节
 AN_EEPROM_MAC_5G = 0x0A             # 6 字节
@@ -762,7 +777,7 @@ def an4475_wifi_defaults(base_mac):
 
 
 def an4475_eeprom_device_id(eeprom):
-    """EEPROM 头 2 字节小端 device id，MT7993 为 0x7993。"""
+    """EEPROM 头 2 字节小端 device id，MT7990AN 为 0x7993。"""
     if len(eeprom) < 2:
         return 0
     return int.from_bytes(eeprom[:2], "little")
@@ -818,6 +833,18 @@ def mt76_pa_lna(eeprom):
     if len(eeprom) < MT_EE_WIFI_CONF + 7:
         return None
     return eeprom[MT_EE_WIFI_CONF + 6] & 0x3
+
+
+_MT76_TEMPLATE_CACHE = None
+
+
+def _mt76_template():
+    """官方 iPA 模板（缓存，批量生成时不用反复读盘）。"""
+    global _MT76_TEMPLATE_CACHE
+    if _MT76_TEMPLATE_CACHE is None:
+        with open(MT76_DEFAULT_IPA_PATH, "rb") as f:
+            _MT76_TEMPLATE_CACHE = f.read()
+    return _MT76_TEMPLATE_CACHE
 
 
 def mt76_carve(eeprom):
@@ -1131,6 +1158,17 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
                          len(raw), len(use))
         img[ent + AN_NAME_MAX + 12] = compr
 
+    # 尾部再放一份 mt76 能直接加载的 7 680 B（模板打底），OpenWrt 侧 nvmem
+    # 指到 AN_MT76_FIXED_OFF 即可，不必现场转换。
+    if AN_WLAN_EEPROM in files:
+        bin_ = mt76_from_template(_mt76_template(), files[AN_WLAN_EEPROM])
+        end = AN_MT76_FIXED_OFF + len(bin_)
+        if end > AN_COMPACT_SIZE:
+            raise ValueError("mt76 槽 0x%06X 放不下 %d 字节"
+                             % (AN_MT76_FIXED_OFF, AN_MT76_SIZE))
+        img[AN_MT76_FIXED_OFF:end] = bin_
+        max_end = max(max_end, end)
+
     struct.pack_into("<I", img, 0x18, max_end - AN_PAYLOAD_OFF)
     return bytes(img)
 
@@ -1388,7 +1426,7 @@ def main():
                 print("  Wi-Fi     : %s，%d 字节，device id 0x%04X"
                       % (AN_WLAN_EEPROM, len(eep), devid))
                 if devid != 0x7993:
-                    print("    警告: device id 0x%04X != 0x7993，可能不是 MT7993"
+                    print("    警告: device id 0x%04X != 0x7993，可能不是 MT7990AN"
                           % devid)
             print("  出厂文件  : %d 个，共 %d 字节"
                   % (len(files), sum(len(v) for v in files.values())))
@@ -1447,7 +1485,17 @@ def main():
             ee = files.get(AN_WLAN_EEPROM) if files else None
             if ee is None:
                 sys.exit("导出 mt76 EEPROM 需要 --bin 里有 %s" % AN_WLAN_EEPROM)
-            if args.mt76_carve:
+            slot = None
+            if args.bin and not args.mt76_carve:
+                try:
+                    with open(args.bin, "rb") as f:
+                        slot = compact_mt76(f.read())
+                except OSError:
+                    slot = None
+            if slot is not None:
+                bin_ = slot
+                mode = "取自容器 0x%06X 的 mt76 槽" % AN_MT76_FIXED_OFF
+            elif args.mt76_carve:
                 bin_ = mt76_carve(ee)
                 mode = "原样截取"
             else:
