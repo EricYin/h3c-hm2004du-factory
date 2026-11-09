@@ -1,9 +1,9 @@
 [package]
-name = "h3c-factory"
+name = "an758x-factory"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
-description = "H3C HM2004-DU factory partition editor - a Rust/egui port of fiberhome-factory, retargeted to the AN7581 FTTR gateway."
+description = "AN758X factory partition editor (H3C HM2004-DU / HL202-DU / AN4475) - a Rust/egui port of fiberhome-factory."
 
 # This crate is a derivative of `fiberhome-factory` (GPL-2.0-only) and therefore
 # ships under the same licence. See the "许可证" section of README.md.

@@ -1,6 +1,9 @@
-# H3C HM2004-DU / HL202-DU / AN4475 Factory Editor
+# AN758X Factory — H3C HM2004-DU / HL202-DU / AN4475 出厂分区编辑器
 
-Rust + egui 图形工具，用于**查看 / 编辑 / 对照** H3C FTTR 设备的出厂分区里的设备身份与校准数据。支持三种机型（顶栏下拉切换）：
+> 项目统一命名为 **AN758X-factory**（原 `h3c-hm2004du-factory`）：可执行文件、CI 产物、
+> 包名、Python 伴生脚本全部同步改名，功能与数据布局不变。
+
+Rust + egui 图形工具，用于**查看 / 编辑 / 对照** H3C FTTR 设备的出厂分区里的设备身份与校准数据。支持三种机型，在顶栏第二行的**机型下拉框**里切换：
 
 | 机型 | 角色 | 出厂分区 | 下行 PON 校准 | 紧凑镜像 |
 |---|---|---|---|---|
@@ -117,7 +120,7 @@ sudo apt-get install -y build-essential libx11-dev libxkbcommon-dev pkg-config
 cargo build --release --features linux-x11
 ```
 
- 界面仿上游 FiberHome 编辑器：顶栏「新建 / 打开 / 保存 1 MiB / 保存真实布局」+ 状态行，「身份信息」区（标签 MAC / 设备序列号，各带随机按钮），派生 MAC 只读表，PON 校准与 Wi-Fi EEPROM 为「替换 / 导出 / 清空」分组行。顶栏的机型是**下拉框**（`主机 HM2004-DU` / `从机 HL202-DU` / `AN4475 (10G PON)`）；H3C 两套面板都显示派生 MAC 表（末字节 +1/+2/+4/+5），从机面板另外只读展示 GUD 出厂字符串，AN4475 面板另有 Wi-Fi 2.4G/5G MAC 输入框与 MT7993 device id 提示。
+界面仿上游 FiberHome 编辑器：顶栏第一行是标题，第二行是**机型下拉框**（`主机 HM2004-DU` / `从机 HL202-DU` / `AN4475 (10G PON)`，也可用 `Ctrl+1/2/3` 直接切换）与动作按钮（`新建` / `打开…` / `打开对应分区` / `保存`）；按钮组左对齐、自动换行，窗口再窄也不会有按钮被挤出可视区。下面依次是状态行、「身份信息」区（标签 MAC / 设备序列号，各带随机按钮）、派生 MAC 只读表、PON 校准与 Wi-Fi EEPROM 的「替换 / 导出 / 清空」分组行。H3C 两套面板都显示派生 MAC 表（末字节 +1/+2/+4/+5），从机面板另外只读展示 GUD 出厂字符串，AN4475 面板另有 Wi-Fi 2.4G/5G MAC 输入框与 MT7993 device id 提示。
 
 **PON 硬件由导入数据决定**：`上行 PON 校准` 行的标题会显示从校准 blob 识别出的芯片——H3C 真机格式把型号以填充 ASCII 写在块内（实测 `0x1c0428` = `EN7572`，厂商 `ECONET` 因无数字被跳过）；若导入的是 FiberHome 的 `APONCAL` 格式则读 `0x0c` 芯片 ID（1=GN28L95、2=UX3363）；都识别不出时只显示「上行 PON 校准」。这样换用其它光模块的备份会自动显示对应型号。
 
@@ -134,9 +137,9 @@ cargo build --release --features linux-x11
 也可在命令行一次传两个文件（顺序任意）：
 
 ```bash
-h3c-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+an758x-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
 # Linux/macOS
-./h3c-factory mtd14_reservearea.bin mtd13_h3c.bin
+./an758x-factory mtd14_reservearea.bin mtd13_h3c.bin
 ```
 
 状态栏下方会显示两个分区各自的来源文件名，`<未载入>` 表示该分区尚未打开。
@@ -151,23 +154,23 @@ h3c-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
 
 ## Python 伴生工具（无需 Rust）
 
-`h3c_factory_demo.py` 是命令行版，逻辑与 `src/model.rs::encode()` 完全一致：
+`an758x_factory_demo.py` 是命令行版，逻辑与 `src/model.rs::encode()` 完全一致：
 
 ```bash
 # 生成 1 MiB 紧凑镜像（默认）
-python3 h3c_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a -o factory-h3c-1mib.bin
+python3 an758x_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a -o factory-h3c-1mib.bin
 
 # 生成真实偏移布局镜像（~1.75 MiB）
-python3 h3c_factory_demo.py gen --layout true --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a -o factory-h3c-layout.bin
+python3 an758x_factory_demo.py gen --layout true --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a -o factory-h3c-layout.bin
 
 # 从真实 reservearea 备份解析
-python3 h3c_factory_demo.py parse --bin mtd14_reservearea.bin
+python3 an758x_factory_demo.py parse --bin mtd14_reservearea.bin
 
 # 从 mtd13 解析下行 PON 口校准
-python3 h3c_factory_demo.py parse --bin mtd13_h3c.bin
+python3 an758x_factory_demo.py parse --bin mtd13_h3c.bin
 
 # 把下行 PON 口校准一并打进 1 MiB 紧凑镜像（--poncal 接受 mtd13 或裸 288 字节 blob）
-python3 h3c_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a \
+python3 an758x_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a \
     --poncal mtd13_h3c.bin -o factory-h3c-1mib.bin
 ```
 
@@ -175,13 +178,13 @@ python3 h3c_factory_demo.py gen --sn H3CT0005EBF0 --mac 44:76:09:65:06:4a \
 
 ```bash
 # 解析从机 mtd12（同时打印 GUD 全部字段）
-python3 h3c_factory_demo.py hl202 --bin mtd12.bin
+python3 an758x_factory_demo.py hl202 --bin mtd12.bin
 
 # 从 mtd12 直接转成从机 512 KiB 镜像
-python3 h3c_factory_demo.py hl202 --bin mtd12.bin -o factory-hl202-512k.bin
+python3 an758x_factory_demo.py hl202 --bin mtd12.bin -o factory-hl202-512k.bin
 
 # 只换 SN / MAC 再生成
-python3 h3c_factory_demo.py hl202 --bin mtd12.bin \
+python3 an758x_factory_demo.py hl202 --bin mtd12.bin \
     --sn H3CT091030F8 --mac 44:76:09:10:30:f8 -o factory-hl202-512k.bin
 ```
 
@@ -189,20 +192,20 @@ python3 h3c_factory_demo.py hl202 --bin mtd12.bin \
 
 ```bash
 # 解析 mtd9 备份（打印身份字段、9 个派生 MAC、21 个出厂文件）
-python3 h3c_factory_demo.py an4475 --bin mtd9_factory.bin
+python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin
 
 # 直接转成 1 MiB 容器
-python3 h3c_factory_demo.py an4475 --bin mtd9_factory.bin -o factory-an4475-1mib.bin
+python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin -o factory-an4475-1mib.bin
 
 # 换身份再生成（出厂文件仍取自备份，只改身份）
-python3 h3c_factory_demo.py an4475 --bin mtd9_factory.bin \
+python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin \
     --sn F3200D49F2904E800 --mac D4:9F:29:04:E8:00 \
     --eth-mac D4:A0:29:04:E9:00 --gpon-sn 46485454C26A6A00 \
     --gpon-pw HG26099999 --wifi-24 D4:9F:29:04:E8:06 \
     --wifi-5g D4:9F:29:04:E8:07 -o factory-an4475-1mib.bin
 
 # 也可以直接读回已生成的 1 MiB 容器
-python3 h3c_factory_demo.py an4475 --bin factory-an4475-1mib.bin
+python3 an758x_factory_demo.py an4475 --bin factory-an4475-1mib.bin
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
@@ -398,7 +401,7 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 ## 目录结构
 
 ```
-h3c-factory/
+an758x-factory/
 ├── Cargo.toml
 ├── Cargo.lock                 # 锁定 egui/eframe 0.36.2
 ├── LICENSE                    # GPL-2.0-only
@@ -412,7 +415,7 @@ h3c-factory/
 │   ├── hl202.rs     # HL202-DU 布局常量 + Hl202 + encode_compact（512 KiB）
 │   ├── an4475.rs    # AN4475：mtd9 UBI/UBIFS 解析 + 1 MiB 容器
 │   └── import.rs    # 解析真实 factory 卷 / mtd13 UBIFS
-├── h3c_factory_demo.py
+├── an758x_factory_demo.py
 └── examples/
     ├── factory-h3c-demo.bin          # 主机 1 MiB 示例
     └── factory-hl202-demo-512k.bin   # 从机 512 KiB 示例

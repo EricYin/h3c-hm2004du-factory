@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! H3C HM2004-DU Factory Editor — egui port of `fiberhome-factory`.
+//! AN758X Factory — egui port of `fiberhome-factory`.
 //!
 //! The UI deliberately mirrors the upstream FiberHome editor: a top bar with
 //! 新建 / 打开 / 保存, a status line, an 身份信息 section with per-field 随机
@@ -287,10 +287,14 @@ impl Editor {
 
     /// Dispatch on content so the user can pick either file in the same dialog.
     fn open_auto(&mut self, bytes: &[u8], name: &str) {
-        if import::looks_like_mtd13(bytes) {
-            self.open_downlink(bytes, name);
-        } else if an4475::is_compact(bytes) || an4475::looks_like_volume(bytes) {
+        // AN4475 必须排在 mtd13 之前：mtd9 是**整片 NAND**，开头就是 `UBI#`，
+        // 而它唯一的卷 fhdata 本身又是 UBIFS —— `looks_like_mtd13`（长度≥mtd13
+        // 且以 UBI# 开头）会把 25 MiB 的 mtd9 直接认成 mtd13，然后报
+        // “未找到 /bosa/ 校准表”。用卷名 `fhdata` 先把它挑出来。
+        if an4475::is_compact(bytes) || an4475::looks_like_volume(bytes) {
             self.open_an(bytes, name);
+        } else if import::looks_like_mtd13(bytes) {
+            self.open_downlink(bytes, name);
         } else if hl202::is_compact(bytes) || hl202::looks_like_hl202_volume(bytes) {
             self.open_hl202(bytes, name);
         } else {
@@ -323,157 +327,214 @@ impl eframe::App for Editor {
         //    `Arc<Style>`，只改 ctx 对本帧无效（要等下一帧）。钉一下，首帧就不闪。
         ui.set_style(apply_light_theme(ui.ctx()));
 
-        // ---- 顶栏：标题 + 机型下拉 + 动作 ----
+        // ---- 顶栏：标题 ----
         ui.horizontal(|ui| {
-            ui.heading("H3C Factory");
+            ui.heading("AN758X Factory");
             ui.separator();
-            // 机型改成下拉框：三套布局互不相通（magic 不同），切换只是换面板，
-            // 已载入的数据各自保留在 factory / hl202 / an 里，不会互相覆盖。
-            ui.label("机型");
+            ui.label(
+                egui::RichText::new("H3C HM2004-DU / HL202-DU / AN4475 出厂分区编辑器").weak(),
+            );
+        });
+
+        // 机型快捷键兜底：Ctrl+1/2/3（mac 上是 ⌘+1/2/3）。
+        // 远程桌面 / 部分窗口管理器下弹出层可能拿不到鼠标焦点，键盘仍可用；
+        // 文本框里按 Ctrl+数字不会产生字符，所以不会干扰 SN 编辑。
+        let hotkey = ui.ctx().input(|i| {
+            if !i.modifiers.command && !i.modifiers.alt {
+                return None;
+            }
+            [
+                (egui::Key::Num1, Kind::Hm2004),
+                (egui::Key::Num2, Kind::Hl202),
+                (egui::Key::Num3, Kind::An4475),
+            ]
+            .into_iter()
+            .find(|(key, _)| i.key_pressed(*key))
+            .map(|(_, k)| k)
+        });
+        if let Some(k) = hotkey {
+            if k != self.kind {
+                self.switch_kind(k);
+            }
+        }
+
+        // ---- 机型下拉 ----
+        // 单独占一行，不再和标题挤在一起：
+        //  1) `ComboBox` 的弹层宽度直接取自按钮宽度，而按钮宽度又被
+        //     `ui.available_width()` 夹住；跟在 heading 后面时只剩 150 px 左右，
+        //     "AN4475 (10G PON)" 会被压窄，看着像点不开。
+        //  2) 放在行首能让弹层向左对齐，鼠标移动路径稳定。
+        // 三套布局互不相通（magic 不同），切换只是换面板，已载入的数据各自
+        // 保留在 factory / hl202 / an 里，不会互相覆盖。
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("机型").strong());
             let mut picked = self.kind;
-            egui::ComboBox::from_id_salt("model_select")
-                .selected_text(self.kind.label())
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for k in Kind::ALL {
-                        ui.selectable_value(&mut picked, k, k.label());
-                    }
-                });
+            // 按钮内边距放大到 8×6：默认下拉框只有 20 px 高，紧贴窗口上沿时
+            // 鼠标稍偏一点就落到标题栏（变成拖动窗口），实际体验就是"点不动"。
+            // 撑到 ~32 px 后整块都是可点区域。
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+                egui::ComboBox::from_id_salt("an758x_model_select")
+                    .selected_text(egui::RichText::new(self.kind.label()).size(15.0))
+                    .width(250.0)
+                    .height(220.0)
+                    .show_ui(ui, |ui| {
+                        // 弹层里的选中背景默认只包住文字，条目之间点空白没反应，
+                        // 手感像一排纯文本。撑到按钮宽度后整行都可点。
+                        ui.set_min_width(238.0);
+                        for k in Kind::ALL {
+                            if ui
+                                .selectable_label(
+                                    picked == k,
+                                    egui::RichText::new(k.label()).size(15.0),
+                                )
+                                .clicked()
+                            {
+                                picked = k;
+                            }
+                        }
+                    });
+            });
             if picked != self.kind {
                 self.switch_kind(picked);
             }
+            ui.label(egui::RichText::new("点击展开选择（Ctrl+1/2/3）").weak().small());
         });
-        // 标题 + 机型切换 + 8 个动作按钮挤在同一行，在 720 px 宽下会溢出 ——
-        // `horizontal` 不换行，右对齐的按钮组会被推出可视区、整组看不见。
-        // 拆成两行：第一行标题与机型，第二行动作按钮（右对齐）。
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // 动作按钮：左对齐 + 自动换行。
+        // 原先是「右对齐单行」，760 px 下 8 个按钮总宽超出，右对齐会把超出
+        // 的部分推到可视区左侧之外 —— 表现为「保存 1 MiB」只剩半个字。
+        // `horizontal_wrapped` 让窗口再窄也只会换行，不会有按钮消失。
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("新建").clicked() {
                 match self.kind {
                     Kind::Hm2004 => {
-                        if ui.button("保存 1 MiB").clicked() {
-                            self.apply_to_factory();
-                            let img = self.factory.encode_1mib();
-                            self.save_image(img, "factory-h3c-1mib.bin");
-                        }
-                        if ui.button("保存真实布局").clicked() {
-                            self.apply_to_factory();
-                            let img = self.factory.encode();
-                            self.save_image(img, "factory-h3c-layout.bin");
-                        }
+                        self.factory = Factory::new();
+                        self.sync_from_factory();
+                        self.msg = "新建 HM2004-DU Factory".into();
                     }
                     Kind::Hl202 => {
-                        if ui.button("保存 512 KiB").clicked() {
-                            self.apply_to_hl202();
-                            let img = self.hl202.encode_compact();
-                            self.save_image(img, "factory-hl202-512k.bin");
-                        }
+                        self.hl202 = Hl202::new();
+                        self.sync_from_hl202();
+                        self.msg = "新建 HL202-DU Factory".into();
                     }
                     Kind::An4475 => {
-                        if ui.button("保存 1 MiB").clicked() {
-                            self.apply_to_an();
-                            match self.an.encode_compact() {
-                                Ok(img) => self.save_image(img, "factory-an4475-1mib.bin"),
-                                Err(e) => self.msg = format!("生成失败: {e}"),
+                        self.an = An4475::new();
+                        self.sync_from_an();
+                        self.msg = "新建 AN4475（出厂文件需从 mtd9 备份导入）".into();
+                    }
+                }
+                self.src_factory = None;
+                self.src_downlink = None;
+                self.gud.clear();
+            }
+            if ui.button("打开…").clicked() {
+                if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
+                    match std::fs::read(&p) {
+                        Ok(b) => {
+                            let name = p.display().to_string();
+                            self.open_auto(&b, &name);
+                        }
+                        Err(e) => self.msg = format!("读取失败: {e}"),
+                    }
+                }
+            }
+            match self.kind {
+                Kind::Hm2004 => {
+                    // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
+                    // 互不覆盖（见 open_factory / open_downlink）。
+                    if ui.button("打开出厂区 (mtd14)").clicked() {
+                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                        {
+                            match std::fs::read(&p) {
+                                Ok(b) => {
+                                    let name = p.display().to_string();
+                                    self.open_factory(&b, &name);
+                                }
+                                Err(e) => self.msg = format!("读取失败: {e}"),
+                            }
+                        }
+                    }
+                    if ui.button("打开下行校准 (mtd13)").clicked() {
+                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                        {
+                            match std::fs::read(&p) {
+                                Ok(b) => {
+                                    let name = p.display().to_string();
+                                    self.open_downlink(&b, &name);
+                                }
+                                Err(e) => self.msg = format!("读取失败: {e}"),
                             }
                         }
                     }
                 }
-                if ui.button("打开…").clicked() {
-                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
-                        match std::fs::read(&p) {
-                            Ok(b) => {
-                                let name = p.display().to_string();
-                                self.open_auto(&b, &name);
-                            }
-                            Err(e) => self.msg = format!("读取失败: {e}"),
-                        }
-                    }
-                }
-                match self.kind {
-                    Kind::Hm2004 => {
-                        // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
-                        // 互不覆盖（见 open_factory / open_downlink）。
-                        if ui.button("打开出厂区 (mtd14)").clicked() {
-                            if let Some(p) =
-                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                            {
-                                match std::fs::read(&p) {
-                                    Ok(b) => {
-                                        let name = p.display().to_string();
-                                        self.open_factory(&b, &name);
-                                    }
-                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                Kind::Hl202 => {
+                    if ui.button("打开 mtd12").clicked() {
+                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                        {
+                            match std::fs::read(&p) {
+                                Ok(b) => {
+                                    let name = p.display().to_string();
+                                    self.open_hl202(&b, &name);
                                 }
-                            }
-                        }
-                        if ui.button("打开下行校准 (mtd13)").clicked() {
-                            if let Some(p) =
-                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                            {
-                                match std::fs::read(&p) {
-                                    Ok(b) => {
-                                        let name = p.display().to_string();
-                                        self.open_downlink(&b, &name);
-                                    }
-                                    Err(e) => self.msg = format!("读取失败: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Kind::An4475 => {
-                        if ui.button("打开 mtd9").clicked() {
-                            if let Some(p) =
-                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                            {
-                                match std::fs::read(&p) {
-                                    Ok(b) => {
-                                        let name = p.display().to_string();
-                                        self.open_an(&b, &name);
-                                    }
-                                    Err(e) => self.msg = format!("读取失败: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    Kind::Hl202 => {
-                        if ui.button("打开 mtd12").clicked() {
-                            if let Some(p) =
-                                FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                            {
-                                match std::fs::read(&p) {
-                                    Ok(b) => {
-                                        let name = p.display().to_string();
-                                        self.open_hl202(&b, &name);
-                                    }
-                                    Err(e) => self.msg = format!("读取失败: {e}"),
-                                }
+                                Err(e) => self.msg = format!("读取失败: {e}"),
                             }
                         }
                     }
                 }
-                if ui.button("新建").clicked() {
-                    match self.kind {
-                        Kind::Hm2004 => {
-                            self.factory = Factory::new();
-                            self.sync_from_factory();
-                            self.msg = "新建 HM2004-DU Factory".into();
-                        }
-                        Kind::Hl202 => {
-                            self.hl202 = Hl202::new();
-                            self.sync_from_hl202();
-                            self.msg = "新建 HL202-DU Factory".into();
-                        }
-                        Kind::An4475 => {
-                            self.an = An4475::new();
-                            self.sync_from_an();
-                            self.msg = "新建 AN4475（出厂文件需从 mtd9 备份导入）".into();
+                Kind::An4475 => {
+                    if ui.button("打开 mtd9").clicked() {
+                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                        {
+                            match std::fs::read(&p) {
+                                Ok(b) => {
+                                    let name = p.display().to_string();
+                                    self.open_an(&b, &name);
+                                }
+                                Err(e) => self.msg = format!("读取失败: {e}"),
+                            }
                         }
                     }
-                    self.src_factory = None;
-                    self.src_downlink = None;
-                    self.gud.clear();
                 }
-            });
+            }
+            match self.kind {
+                Kind::Hm2004 => {
+                    if ui.button("保存真实布局").clicked() {
+                        self.apply_to_factory();
+                        let img = self.factory.encode();
+                        self.save_image(img, "factory-h3c-layout.bin");
+                    }
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("保存 1 MiB").strong()))
+                        .clicked()
+                    {
+                        self.apply_to_factory();
+                        let img = self.factory.encode_1mib();
+                        self.save_image(img, "factory-h3c-1mib.bin");
+                    }
+                }
+                Kind::Hl202 => {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("保存 512 KiB").strong()))
+                        .clicked()
+                    {
+                        self.apply_to_hl202();
+                        let img = self.hl202.encode_compact();
+                        self.save_image(img, "factory-hl202-512k.bin");
+                    }
+                }
+                Kind::An4475 => {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("保存 1 MiB").strong()))
+                        .clicked()
+                    {
+                        self.apply_to_an();
+                        match self.an.encode_compact() {
+                            Ok(img) => self.save_image(img, "factory-an4475-1mib.bin"),
+                            Err(e) => self.msg = format!("生成失败: {e}"),
+                        }
+                    }
+                }
+            }
         });
         ui.label(&self.msg);
         ui.separator();
@@ -778,21 +839,37 @@ impl Editor {
 
         ui.add_space(6.0);
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Wi-Fi 2.4G MAC");
-            ui.add(egui::TextEdit::singleline(&mut self.wifi_2g4).desired_width(FIELD));
-            if ui.button("按基准 MAC 派生").clicked() {
-                let b = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
-                self.an.wifi_2g4 = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_2G4);
-                self.an.wifi_5g = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_5G);
-                self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
-                self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Wi-Fi 5G MAC");
-            ui.add(egui::TextEdit::singleline(&mut self.wifi_5g).desired_width(FIELD));
-        });
+        // 用 Grid 而不是两个 horizontal：两个标签字数不同，输入框左边缘会错开
+        // 4 px（截图里很明显）；Grid 自动把三列对齐。
+        egui::Grid::new("an_wifi_mac")
+            .num_columns(3)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Wi-Fi 2.4G MAC");
+                // Grid 单元格的可用宽度首帧是 0，`desired_width` 会被压缩成
+                // 40 px；用 add_sized 钉死宽高，列宽才会按 280 px 撑开。
+                ui.add_sized(
+                    [FIELD, 22.0],
+                    egui::TextEdit::singleline(&mut self.wifi_2g4),
+                );
+                if ui.button("按基准 MAC 派生").clicked() {
+                    let b = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
+                    self.an.wifi_2g4 = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_2G4);
+                    self.an.wifi_5g = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_5G);
+                    self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
+                    self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
+                }
+                ui.end_row();
+
+                ui.label("Wi-Fi 5G MAC");
+                ui.add_sized(
+                    [FIELD, 22.0],
+                    egui::TextEdit::singleline(&mut self.wifi_5g),
+                );
+                ui.label("");
+                ui.end_row();
+            });
+        ui.add_space(5.0);
         ui.weak(format!(
             "写 EEPROM +{:#04X}/+{:#04X} 与 factory_conf 的 APMAC_1/APMAC_2；device id {}",
             an4475::AN_EEPROM_MAC_2G4,
@@ -987,12 +1064,13 @@ fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 780.0])
-            .with_min_inner_size([680.0, 600.0]),
+            // 800 px 起：顶栏按钮一行放得下（680 时会挤成两行，虽不丢按钮但很挤）。
+            .with_inner_size([860.0, 800.0])
+            .with_min_inner_size([700.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "H3C Factory 编辑器",
+        "AN758X Factory 编辑器",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
@@ -1015,11 +1093,11 @@ fn main() -> eframe::Result {
                 gud: Vec::new(),
             };
             ed.sync_from_factory();
-            // Like upstream: allow `h3c-factory.exe backup.bin`
+            // Like upstream: allow `an758x-factory.exe backup.bin`
             // (or dragging a .bin onto the exe) to open a file directly.
             // Multiple paths may be given, which is how a real unit's two
             // partitions get loaded in one go:
-            //   h3c-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
+            //   an758x-factory.exe mtd14_reservearea.bin mtd13_h3c.bin
             let mut loaded = 0usize;
             for path in std::env::args_os().skip(1) {
                 match std::fs::read(&path) {
