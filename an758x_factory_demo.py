@@ -659,6 +659,8 @@ AN_COMPACT_SIZE = 0x200000
 AN_COMPACT_MAGIC = b"AN4-2MiB"
 AN_COMPACT_MAGIC_V1 = b"AN4-1MiB"      # 旧版 1 MiB 容器，仅用于读取兼容
 AN_COMPACT_SIZE_V1 = 0x100000
+# 2 MiB 容器里 EEPROM 的固定偏移（不压缩，方便直接用 hex 工具看校准区）。
+AN_EEPROM_FIXED_OFF = 0x40000
 AN_COMPACT_VERSION = 1
 AN_TOC_OFF = 0x1000
 AN_PAYLOAD_OFF = 0x2000
@@ -1010,26 +1012,36 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
     img[AN_H_WIFI_2G4:AN_H_WIFI_2G4 + 6] = wifi_2g4
     img[AN_H_WIFI_5G:AN_H_WIFI_5G + 6] = wifi_5g
 
+    # EEPROM 走固定偏移、原样存；其余文件从 0x2000 起顺序压缩摆放。
     cursor = AN_PAYLOAD_OFF
+    max_end = AN_PAYLOAD_OFF
     for idx, name in enumerate(names):
         raw = files[name]
-        packed = zlib.compress(raw, 9)
-        use = packed if len(packed) < len(raw) - 16 else raw
-        compr = 1 if use is packed else 0
-        if cursor + len(use) > AN_COMPACT_SIZE:
-            raise ValueError(
-                "载荷超出 2 MiB（%s 起需要 %d 字节）" % (name, cursor + len(use))
-            )
-        img[cursor:cursor + len(use)] = use
+        if name == AN_WLAN_EEPROM:
+            if AN_EEPROM_FIXED_OFF + len(raw) > AN_COMPACT_SIZE:
+                raise ValueError("%s 有 %d 字节，放不进 0x%06X 起的固定区"
+                                 % (name, len(raw), AN_EEPROM_FIXED_OFF))
+            at, use, compr = AN_EEPROM_FIXED_OFF, raw, 0
+            max_end = max(max_end, at + len(use))
+        else:
+            packed = zlib.compress(raw, 9)
+            use = packed if len(packed) < len(raw) - 16 else raw
+            compr = 1 if use is packed else 0
+            if cursor + len(use) > AN_EEPROM_FIXED_OFF:
+                raise ValueError("0x2000–0x%06X 区放不下：%s 需要写到 0x%06X"
+                                 % (AN_EEPROM_FIXED_OFF, name, cursor + len(use)))
+            at = cursor
+            cursor += len(use)
+            max_end = max(max_end, cursor)
+        img[at:at + len(use)] = use
         ent = AN_TOC_OFF + idx * AN_TOC_ENTRY
         nb = name.encode("utf-8")[:AN_NAME_MAX - 1]
         img[ent:ent + len(nb)] = nb
-        struct.pack_into("<III", img, ent + AN_NAME_MAX, cursor - AN_PAYLOAD_OFF,
+        struct.pack_into("<III", img, ent + AN_NAME_MAX, at - AN_PAYLOAD_OFF,
                          len(raw), len(use))
         img[ent + AN_NAME_MAX + 12] = compr
-        cursor += len(use)
 
-    struct.pack_into("<I", img, 0x18, cursor - AN_PAYLOAD_OFF)
+    struct.pack_into("<I", img, 0x18, max_end - AN_PAYLOAD_OFF)
     return bytes(img)
 
 

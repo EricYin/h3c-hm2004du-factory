@@ -120,7 +120,7 @@ sudo apt-get install -y build-essential libx11-dev libxkbcommon-dev pkg-config
 cargo build --release --features linux-x11
 ```
 
-界面仿上游 FiberHome 编辑器：顶栏第一行是标题，第二行是**机型按钮**（`机型：…  ▼`，点击就地展开 `主机 HM2004-DU` / `从机 HL202-DU` / `AN4475 (10G PON)` 三个选项，也可用 `Ctrl+1/2/3` 直接切换）与动作按钮（`新建` / `打开…` / `打开对应分区` / `保存`）；按钮组左对齐、自动换行，窗口再窄也不会有按钮被挤出可视区。下面依次是状态行、「身份信息」区（标签 MAC / 设备序列号，各带随机按钮）、派生 MAC 只读表、PON 校准与 Wi-Fi EEPROM 的「替换 / 导出 / 清空」分组行。H3C 两套面板都显示派生 MAC 表（末字节 +1/+2/+4/+5），从机面板另外只读展示 GUD 出厂字符串，AN4475 面板另有 Wi-Fi 2.4G/5G MAC 输入框与 MT7993 device id 提示。
+界面仿上游 FiberHome 编辑器：顶栏第一行是标题，第二行是**机型按钮**（`机型：…  ▼`，点击就地展开 `主机 HM2004-DU` / `从机 HL202-DU` / `AN4475 (10G PON)` 三个选项，也可用 `Ctrl+1/2/3` 直接切换）与动作按钮（`新建` / `打开…` / `打开对应分区` / `保存`）；按钮组左对齐、自动换行，窗口再窄也不会有按钮被挤出可视区；整个界面在滚动区里，内容超出时右侧常显竖向滚动条（滚轮 / 拖动均可）。下面依次是状态行、「身份信息」区（标签 MAC / 设备序列号，各带随机按钮）、派生 MAC 只读表、PON 校准与 Wi-Fi EEPROM 的「替换 / 导出 / 清空」分组行。H3C 两套面板都显示派生 MAC 表（末字节 +1/+2/+4/+5），从机面板另外只读展示 GUD 出厂字符串，AN4475 面板另有 Wi-Fi 2.4G/5G MAC 输入框与 MT7993 device id 提示。
 
 **PON 硬件由导入数据决定**：`上行 PON 校准` 行的标题会显示从校准 blob 识别出的芯片——H3C 真机格式把型号以填充 ASCII 写在块内（实测 `0x1c0428` = `EN7572`，厂商 `ECONET` 因无数字被跳过）；若导入的是 FiberHome 的 `APONCAL` 格式则读 `0x0c` 芯片 ID（1=GN28L95、2=UX3363）；都识别不出时只显示「上行 PON 校准」。这样换用其它光模块的备份会自动显示对应型号。
 
@@ -195,17 +195,20 @@ python3 an758x_factory_demo.py hl202 --bin mtd12.bin \
 python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin
 
 # 直接转成 2 MiB 容器
-python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin -o factory-an4475-1mib.bin
+python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin -o factory-an4475-2mib.bin
 
 # 换身份再生成（出厂文件仍取自备份，只改身份）
 python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin \
     --sn F3200D49F2904E800 --mac D4:9F:29:04:E8:00 \
     --eth-mac D4:A0:29:04:E9:00 --gpon-sn 46485454C26A6A00 \
     --gpon-pw HG26099999 --wifi-24 D4:9F:29:04:E8:06 \
-    --wifi-5g D4:9F:29:04:E8:07 -o factory-an4475-1mib.bin
+    --wifi-5g D4:9F:29:04:E8:07 -o factory-an4475-2mib.bin
 
 # 也可以直接读回已生成的 2 MiB 容器
-python3 an758x_factory_demo.py an4475 --bin factory-an4475-1mib.bin
+python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin
+
+# GUI 程序同样带一个无界面批处理入口（产线批量转换用）
+an758x-factory --export-an mtd9_factory.bin factory-an4475-2mib.bin
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
@@ -366,9 +369,12 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 | `0x000096` | 6 | Wi-Fi 2.4G MAC（与 EEPROM `+0x04`、`APMAC_1` 同步） |
 | `0x00009C` | 6 | Wi-Fi 5G MAC（与 EEPROM `+0x0A`、`APMAC_2` 同步） |
 | `0x001000` | 48/项 | TOC：名 32 + `off`/`raw_len`/`stored_len` 各 4 + 压缩标志 1 |
-| `0x002000` | — | 载荷（能压就压，压不动原样存） |
+| `0x002000` | — | 其余 20 个文件（能压就压，压不动原样存） |
+| `0x040000` | 1 353 728 | **`MT7993_EEPROM.bin` 原样存放、不压缩**（Wi-Fi 校准区只读这个偏移即可） |
 
 实测载荷 **210 962 字节**（EEPROM 从 1.32 MiB 压到约 195 KiB），只占 2 MiB 的 10%，余量非常充足。载荷区之后到 `0x200000` 全部填 `0xFF`。若换用更大的 EEPROM 导致溢出，导出会直接报错并指出是哪个文件、写到哪个偏移，不会静默截断。
+
+**Wi-Fi 校准可直接读**：EEPROM 不再压缩，固定摆在 `0x040000`，长度 1 353 728 字节，头部 `0x7993` 就是 device ID。用任何 hex 工具打开 2 MiB 镜像、跳到 `0x40000` 就是完整校准区（`+0x04`/`+0x0A` 是 2.4G/5G MAC），不需要解压、也不需要这个工具。
 
 **旧镜像兼容**：早先生成的 1 MiB 容器（magic `AN4-1MiB`）头部偏移与本版完全一致，工具仍能读入并显示，状态栏会标注「旧版，导出将升级为 2 MiB」；重新保存即得到 2 MiB + `AN4-2MiB`。
 

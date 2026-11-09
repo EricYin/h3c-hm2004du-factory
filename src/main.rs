@@ -334,225 +334,243 @@ impl eframe::App for Editor {
         //    `Arc<Style>`，只改 ctx 对本帧无效（要等下一帧）。钉一下，首帧就不闪。
         ui.set_style(apply_light_theme(ui.ctx()));
 
-        // ---- 顶栏：标题 ----
-        ui.horizontal(|ui| {
-            ui.heading("AN758X Factory");
-            ui.label(
-                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
-                    .weak()
-                    .small(),
-            );
-            ui.separator();
-            ui.label(
-                egui::RichText::new("H3C HM2004-DU / HL202-DU / AN4475 出厂分区编辑器").weak(),
-            );
-        });
+        // 整个界面都放进滚动区。AN4475 面板有 21 个文件清单 + 9 行派生 MAC +
+        // 三个分组，窗口 800 px 放不下；`App::ui` 给的根 `Ui` **不会**自动滚动，
+        // 超出部分直接被裁掉，滚轮也没反应 —— 表现就是"不能上下滑"。
+        // 显式给高度：`App::ui` 的根 `Ui` 可用高度可能是 `INFINITY`，
+        // 不钉死的话 ScrollArea 的视口也是无限大，内容只溢出、不产生滚动
+        // —— 这就是"滚轮没反应"的另一半原因。滚动条常显，让用户看得见。
+        let view_h = ui
+            .available_height()
+            .min(ui.ctx().viewport_rect().height())
+            .max(200.0);
+        egui::ScrollArea::vertical()
+            .max_height(view_h)
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                // 子 Ui 是新的 style 快照，再钉一次亮色。
+                ui.set_style(apply_light_theme(ui.ctx()));
+            // ---- 顶栏：标题 ----
+            ui.horizontal(|ui| {
+                ui.heading("AN758X Factory");
+                ui.label(
+                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                        .weak()
+                        .small(),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("H3C HM2004-DU / HL202-DU / AN4475 出厂分区编辑器").weak(),
+                );
+            });
 
-        // 机型快捷键兜底：Ctrl+1/2/3（mac 上是 ⌘+1/2/3）。
-        // 远程桌面 / 部分窗口管理器下弹出层可能拿不到鼠标焦点，键盘仍可用；
-        // 文本框里按 Ctrl+数字不会产生字符，所以不会干扰 SN 编辑。
-        let hotkey = ui.ctx().input(|i| {
-            if !i.modifiers.command && !i.modifiers.alt {
-                return None;
+            // 机型快捷键兜底：Ctrl+1/2/3（mac 上是 ⌘+1/2/3）。
+            // 远程桌面 / 部分窗口管理器下弹出层可能拿不到鼠标焦点，键盘仍可用；
+            // 文本框里按 Ctrl+数字不会产生字符，所以不会干扰 SN 编辑。
+            let hotkey = ui.ctx().input(|i| {
+                if !i.modifiers.command && !i.modifiers.alt {
+                    return None;
+                }
+                [
+                    (egui::Key::Num1, Kind::Hm2004),
+                    (egui::Key::Num2, Kind::Hl202),
+                    (egui::Key::Num3, Kind::An4475),
+                ]
+                .into_iter()
+                .find(|(key, _)| i.key_pressed(*key))
+                .map(|(_, k)| k)
+            });
+            if let Some(k) = hotkey {
+                if k != self.kind {
+                    self.switch_kind(k);
+                }
             }
-            [
-                (egui::Key::Num1, Kind::Hm2004),
-                (egui::Key::Num2, Kind::Hl202),
-                (egui::Key::Num3, Kind::An4475),
-            ]
-            .into_iter()
-            .find(|(key, _)| i.key_pressed(*key))
-            .map(|(_, k)| k)
-        });
-        if let Some(k) = hotkey {
-            if k != self.kind {
-                self.switch_kind(k);
-            }
-        }
 
-        // ---- 机型选择 ----
-        // 这里**故意不用 `egui::ComboBox`**。它的弹层是一个独立 `Area`，开合状态
-        // 存在 `Memory` 里、跨帧读取；在部分 Windows / 远程桌面环境下，点击后
-        // 窗口会进入等待状态，要等下一次鼠标移动才重绘，表现就是"点了没反应"。
-        // 改成内联展开后，列表在**点击的同一帧**就画出来了，不依赖任何跨帧
-        // 弹层状态，也不依赖重绘调度：
-        //   - 整个按钮（含"机型："三个字）都是点击区，点文字也能展开；
-        //   - 条目是普通 Button，整行 292×30 都可点；
-        //   - 选中后立即收起。
-        ui.horizontal(|ui| {
-            let label = format!("机型：{}   ▼", self.kind.label());
-            let btn = egui::Button::new(egui::RichText::new(label).size(15.0));
-            if ui.add_sized([300.0, 34.0], btn).clicked() {
-                self.model_open = !self.model_open;
-                // 打开/收起后立刻要一帧，避免窗口在等待输入时"看着没动"。
-                ui.ctx().request_repaint();
+            // ---- 机型选择 ----
+            // 这里**故意不用 `egui::ComboBox`**。它的弹层是一个独立 `Area`，开合状态
+            // 存在 `Memory` 里、跨帧读取；在部分 Windows / 远程桌面环境下，点击后
+            // 窗口会进入等待状态，要等下一次鼠标移动才重绘，表现就是"点了没反应"。
+            // 改成内联展开后，列表在**点击的同一帧**就画出来了，不依赖任何跨帧
+            // 弹层状态，也不依赖重绘调度：
+            //   - 整个按钮（含"机型："三个字）都是点击区，点文字也能展开；
+            //   - 条目是普通 Button，整行 292×30 都可点；
+            //   - 选中后立即收起。
+            ui.horizontal(|ui| {
+                let label = format!("机型：{}   ▼", self.kind.label());
+                let btn = egui::Button::new(egui::RichText::new(label).size(15.0));
+                if ui.add_sized([300.0, 34.0], btn).clicked() {
+                    self.model_open = !self.model_open;
+                    // 打开/收起后立刻要一帧，避免窗口在等待输入时"看着没动"。
+                    ui.ctx().request_repaint();
+                }
+                ui.label(egui::RichText::new("点击展开（Ctrl+1/2/3）").weak().small());
+            });
+            if self.model_open {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(300.0);
+                    for k in Kind::ALL {
+                        let selected = self.kind == k;
+                        let text = if selected {
+                            egui::RichText::new(format!("✔ {}", k.label())).size(15.0)
+                        } else {
+                            egui::RichText::new(format!("   {}", k.label())).size(15.0)
+                        };
+                        let item = egui::Button::new(text)
+                            .selected(selected)
+                            .wrap_mode(egui::TextWrapMode::Extend);
+                        if ui.add_sized([292.0, 30.0], item).clicked() {
+                            self.switch_kind(k);
+                            self.model_open = false;
+                        }
+                    }
+                });
             }
-            ui.label(egui::RichText::new("点击展开（Ctrl+1/2/3）").weak().small());
-        });
-        if self.model_open {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width(300.0);
-                for k in Kind::ALL {
-                    let selected = self.kind == k;
-                    let text = if selected {
-                        egui::RichText::new(format!("✔ {}", k.label())).size(15.0)
-                    } else {
-                        egui::RichText::new(format!("   {}", k.label())).size(15.0)
-                    };
-                    let item = egui::Button::new(text)
-                        .selected(selected)
-                        .wrap_mode(egui::TextWrapMode::Extend);
-                    if ui.add_sized([292.0, 30.0], item).clicked() {
-                        self.switch_kind(k);
-                        self.model_open = false;
+            // 动作按钮：左对齐 + 自动换行。
+            // 原先是「右对齐单行」，760 px 下 8 个按钮总宽超出，右对齐会把超出
+            // 的部分推到可视区左侧之外 —— 表现为「保存 1 MiB」只剩半个字。
+            // `horizontal_wrapped` 让窗口再窄也只会换行，不会有按钮消失。
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("新建").clicked() {
+                    match self.kind {
+                        Kind::Hm2004 => {
+                            self.factory = Factory::new();
+                            self.sync_from_factory();
+                            self.msg = "新建 HM2004-DU Factory".into();
+                        }
+                        Kind::Hl202 => {
+                            self.hl202 = Hl202::new();
+                            self.sync_from_hl202();
+                            self.msg = "新建 HL202-DU Factory".into();
+                        }
+                        Kind::An4475 => {
+                            self.an = An4475::new();
+                            self.sync_from_an();
+                            self.msg = "新建 AN4475（出厂文件需从 mtd9 备份导入）".into();
+                        }
+                    }
+                    self.src_factory = None;
+                    self.src_downlink = None;
+                    self.gud.clear();
+                }
+                if ui.button("打开…").clicked() {
+                    if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
+                        match std::fs::read(&p) {
+                            Ok(b) => {
+                                let name = p.display().to_string();
+                                self.open_auto(&b, &name);
+                            }
+                            Err(e) => self.msg = format!("读取失败: {e}"),
+                        }
+                    }
+                }
+                match self.kind {
+                    Kind::Hm2004 => {
+                        // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
+                        // 互不覆盖（见 open_factory / open_downlink）。
+                        if ui.button("打开出厂区 (mtd14)").clicked() {
+                            if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_factory(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
+                        }
+                        if ui.button("打开下行校准 (mtd13)").clicked() {
+                            if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_downlink(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
+                        }
+                    }
+                    Kind::Hl202 => {
+                        if ui.button("打开 mtd12").clicked() {
+                            if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_hl202(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
+                        }
+                    }
+                    Kind::An4475 => {
+                        if ui.button("打开 mtd9").clicked() {
+                            if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
+                            {
+                                match std::fs::read(&p) {
+                                    Ok(b) => {
+                                        let name = p.display().to_string();
+                                        self.open_an(&b, &name);
+                                    }
+                                    Err(e) => self.msg = format!("读取失败: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                match self.kind {
+                    Kind::Hm2004 => {
+                        if ui.button("保存真实布局").clicked() {
+                            self.apply_to_factory();
+                            let img = self.factory.encode();
+                            self.save_image(img, "factory-h3c-layout.bin");
+                        }
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("保存 1 MiB").strong()))
+                            .clicked()
+                        {
+                            self.apply_to_factory();
+                            let img = self.factory.encode_1mib();
+                            self.save_image(img, "factory-h3c-1mib.bin");
+                        }
+                    }
+                    Kind::Hl202 => {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("保存 512 KiB").strong()))
+                            .clicked()
+                        {
+                            self.apply_to_hl202();
+                            let img = self.hl202.encode_compact();
+                            self.save_image(img, "factory-hl202-512k.bin");
+                        }
+                    }
+                    Kind::An4475 => {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("保存 2 MiB").strong()))
+                            .clicked()
+                        {
+                            self.apply_to_an();
+                            match self.an.encode_compact() {
+                                Ok(img) => self.save_image(img, "factory-an4475-2mib.bin"),
+                                Err(e) => self.msg = format!("生成失败: {e}"),
+                            }
+                        }
                     }
                 }
             });
-        }
-        // 动作按钮：左对齐 + 自动换行。
-        // 原先是「右对齐单行」，760 px 下 8 个按钮总宽超出，右对齐会把超出
-        // 的部分推到可视区左侧之外 —— 表现为「保存 1 MiB」只剩半个字。
-        // `horizontal_wrapped` 让窗口再窄也只会换行，不会有按钮消失。
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("新建").clicked() {
-                match self.kind {
-                    Kind::Hm2004 => {
-                        self.factory = Factory::new();
-                        self.sync_from_factory();
-                        self.msg = "新建 HM2004-DU Factory".into();
-                    }
-                    Kind::Hl202 => {
-                        self.hl202 = Hl202::new();
-                        self.sync_from_hl202();
-                        self.msg = "新建 HL202-DU Factory".into();
-                    }
-                    Kind::An4475 => {
-                        self.an = An4475::new();
-                        self.sync_from_an();
-                        self.msg = "新建 AN4475（出厂文件需从 mtd9 备份导入）".into();
-                    }
-                }
-                self.src_factory = None;
-                self.src_downlink = None;
-                self.gud.clear();
-            }
-            if ui.button("打开…").clicked() {
-                if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file() {
-                    match std::fs::read(&p) {
-                        Ok(b) => {
-                            let name = p.display().to_string();
-                            self.open_auto(&b, &name);
-                        }
-                        Err(e) => self.msg = format!("读取失败: {e}"),
-                    }
-                }
-            }
-            match self.kind {
-                Kind::Hm2004 => {
-                    // 出厂校准分散在两个分区里，故给两个明确的入口：顺序任意，
-                    // 互不覆盖（见 open_factory / open_downlink）。
-                    if ui.button("打开出厂区 (mtd14)").clicked() {
-                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                        {
-                            match std::fs::read(&p) {
-                                Ok(b) => {
-                                    let name = p.display().to_string();
-                                    self.open_factory(&b, &name);
-                                }
-                                Err(e) => self.msg = format!("读取失败: {e}"),
-                            }
-                        }
-                    }
-                    if ui.button("打开下行校准 (mtd13)").clicked() {
-                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                        {
-                            match std::fs::read(&p) {
-                                Ok(b) => {
-                                    let name = p.display().to_string();
-                                    self.open_downlink(&b, &name);
-                                }
-                                Err(e) => self.msg = format!("读取失败: {e}"),
-                            }
-                        }
-                    }
-                }
-                Kind::Hl202 => {
-                    if ui.button("打开 mtd12").clicked() {
-                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                        {
-                            match std::fs::read(&p) {
-                                Ok(b) => {
-                                    let name = p.display().to_string();
-                                    self.open_hl202(&b, &name);
-                                }
-                                Err(e) => self.msg = format!("读取失败: {e}"),
-                            }
-                        }
-                    }
-                }
-                Kind::An4475 => {
-                    if ui.button("打开 mtd9").clicked() {
-                        if let Some(p) = FileDialog::new().add_filter("bin", &["bin"]).pick_file()
-                        {
-                            match std::fs::read(&p) {
-                                Ok(b) => {
-                                    let name = p.display().to_string();
-                                    self.open_an(&b, &name);
-                                }
-                                Err(e) => self.msg = format!("读取失败: {e}"),
-                            }
-                        }
-                    }
-                }
-            }
-            match self.kind {
-                Kind::Hm2004 => {
-                    if ui.button("保存真实布局").clicked() {
-                        self.apply_to_factory();
-                        let img = self.factory.encode();
-                        self.save_image(img, "factory-h3c-layout.bin");
-                    }
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new("保存 1 MiB").strong()))
-                        .clicked()
-                    {
-                        self.apply_to_factory();
-                        let img = self.factory.encode_1mib();
-                        self.save_image(img, "factory-h3c-1mib.bin");
-                    }
-                }
-                Kind::Hl202 => {
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new("保存 512 KiB").strong()))
-                        .clicked()
-                    {
-                        self.apply_to_hl202();
-                        let img = self.hl202.encode_compact();
-                        self.save_image(img, "factory-hl202-512k.bin");
-                    }
-                }
-                Kind::An4475 => {
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new("保存 2 MiB").strong()))
-                        .clicked()
-                    {
-                        self.apply_to_an();
-                        match self.an.encode_compact() {
-                            Ok(img) => self.save_image(img, "factory-an4475-2mib.bin"),
-                            Err(e) => self.msg = format!("生成失败: {e}"),
-                        }
-                    }
-                }
-            }
-        });
-        ui.label(&self.msg);
-        ui.separator();
+            ui.label(&self.msg);
+            ui.separator();
 
-        match self.kind {
-            Kind::Hm2004 => self.ui_hm2004(ui),
-            Kind::Hl202 => self.ui_hl202(ui),
-            Kind::An4475 => self.ui_an4475(ui),
-        }
+            match self.kind {
+                Kind::Hm2004 => self.ui_hm2004(ui),
+                Kind::Hl202 => self.ui_hl202(ui),
+                Kind::An4475 => self.ui_an4475(ui),
+            }
+            });
     }
 }
 
@@ -925,12 +943,22 @@ impl Editor {
             .default_open(false)
             .show(ui, |ui| {
                 egui::Grid::new("an_files")
-                    .num_columns(2)
+                    .num_columns(3)
                     .spacing([16.0, 2.0])
                     .show(ui, |ui| {
                         for f in &self.an.files {
                             ui.monospace(f.name.as_str());
                             ui.monospace(format!("{} 字节", f.data.len()));
+                            if f.name == an4475::AN_EEPROM {
+                                // 2 MiB 容器里 EEPROM 不压缩、固定摆在这里：
+                                // 拿到镜像直接用 hex 工具按这个偏移就能看校准区。
+                                ui.weak(format!(
+                                    "镜像 0x{:06X} 起 · 未压缩",
+                                    an4475::AN_EEPROM_FIXED_OFF
+                                ));
+                            } else {
+                                ui.label("");
+                            }
                             ui.end_row();
                         }
                     });
@@ -939,6 +967,10 @@ impl Editor {
         ui.add_space(8.0);
         ui.weak("mtd9 = 整个 UBI 设备（25 MiB / 200 个 128 KiB PEB），只有一个动态卷 fhdata（178 LEB），卷上是 UBIFS。");
         ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，其余文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
+        ui.weak(format!(
+            "Wi-Fi 校准（MT7993_EEPROM.bin，1 353 728 字节）在镜像里固定放在 0x{:06X}、原样不压缩，可直接用 hex 工具打开；设备 ID 应为 0x7993。",
+            an4475::AN_EEPROM_FIXED_OFF
+        ));
         ui.weak("身份字段（SN / MAC / GPON SN / 密码）导出时会回写 factory_conf，保持文本与头部一致。");
         ui.weak("导入时按 sqnum 取 UBIFS 每个 key 的最新副本；`.factory_conf.uci-*` 是写入中间态，自动跳过。");
     }
@@ -1070,7 +1102,48 @@ fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
     style
 }
 
+/// 无界面批处理：`an758x-factory --export-an <输入> <输出>`。
+///
+/// 输入可以是 mtd9 备份，也可以是 1/2 MiB 容器；输出一律 2 MiB。
+/// 用途：产线上没有图形环境时批量转换，也方便脚本回归。
+fn export_an_cli(input: &str, output: &str) {
+    let bytes = match std::fs::read(input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取失败 {input}: {e}");
+            return;
+        }
+    };
+    let parsed = if an4475::is_compact(&bytes) {
+        an4475::parse_compact(&bytes)
+    } else {
+        an4475::parse_mtd9(&bytes)
+    };
+    let Some(a) = parsed else {
+        eprintln!("无法识别输入（既不是 mtd9 备份，也不是 AN4-* 容器）: {input}");
+        return;
+    };
+    match a.encode_compact() {
+        Ok(img) => match std::fs::write(output, &img) {
+            Ok(_) => println!(
+                "已写出 {} 字节 -> {output}（{} 个文件，magic {}，EEPROM 固定 0x{:06X}）",
+                img.len(),
+                a.files.len(),
+                String::from_utf8_lossy(&img[..8]),
+                an4475::AN_EEPROM_FIXED_OFF
+            ),
+            Err(e) => eprintln!("写入失败 {output}: {e}"),
+        },
+        Err(e) => eprintln!("生成失败: {e}"),
+    }
+}
+
 fn main() -> eframe::Result {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 4 && argv[1] == "--export-an" {
+        export_an_cli(&argv[2], &argv[3]);
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // 800 px 起：顶栏按钮一行放得下（680 时会挤成两行，虽不丢按钮但很挤）。
@@ -1079,7 +1152,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.3.0",
+        "AN758X Factory 编辑器 v0.4.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

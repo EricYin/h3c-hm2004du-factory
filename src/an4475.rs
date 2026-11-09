@@ -56,8 +56,9 @@
 //! 0x000051  10  GPON 密码（ASCII）
 //! 0x000060  54  派生 MAC 9 项：internet/tr069/voip/priprotocol + eth1..eth5
 //! 0x001000      TOC，每项 48 字节（名 32 + off/raw/stored 各 4 + 压缩标志 1）
-//! 0x002000      载荷（各文件 zlib 或原样）
-//! ---------- 载荷之后至 0x200000 全 0xFF ----------
+//! 0x002000      TOC 之外的其余 20 个文件（zlib 或原样，顺序摆放）
+//! 0x040000      MT7993_EEPROM.bin 原样存放（1 353 728 B，未压缩）
+//! ---------- 其余至 0x200000 全 0xFF ----------
 //! ```
 //!
 //! ## MAC 派生规律（真机实证）
@@ -129,6 +130,13 @@ pub const AN_H_WIFI_5G: usize = 0x9c;
 pub const AN_MAIN_CONF: &str = "factory_conf";
 /// Wi-Fi 校准文件名（1.32 MiB，容器里必须压缩存放）。
 pub const AN_EEPROM: &str = "MT7993_EEPROM.bin";
+
+/// 2 MiB 容器里 Wi-Fi EEPROM 的**固定偏移**，且不压缩。
+///
+/// EEPROM 原始 1 353 728 B，zlib 后约 199 KB —— 压缩只省 1.15 MB，而 2 MiB
+/// 容器本来就有富余。固定摆在这里、原样存储，拿到镜像的人可以直接用 hex
+/// 工具按 `0x40000` 打开看校准区，不必先解压；工具导出/写回也走同一份字节。
+pub const AN_EEPROM_FIXED_OFF: usize = 0x40000;
 
 // Wi-Fi EEPROM 头很短：device id + 版本 + 两个 MAC，0x10..0x190 全 0，
 // 0x190 起才是射频校准表。出厂值仍是芯片厂默认（2.4G/5G 分别
@@ -329,35 +337,53 @@ impl An4475 {
         img[AN_H_WIFI_2G4..AN_H_WIFI_2G4 + 6].copy_from_slice(&self.wifi_2g4);
         img[AN_H_WIFI_5G..AN_H_WIFI_5G + 6].copy_from_slice(&self.wifi_5g);
 
+        // EEPROM 放固定偏移、原样存；其余文件从 0x2000 起顺序压缩摆放。
         let mut cursor = AN_PAYLOAD_OFF;
+        let mut max_end = AN_PAYLOAD_OFF;
         for (i, name) in names.iter().enumerate() {
             let raw = &files[*name];
-            let packed = zlib(raw);
-            // 压缩收益不足 16 字节就原样存，省得白压一遍。
-            let (blob, compr) = if packed.len() + 16 < raw.len() {
-                (packed, 1u8)
+            let (blob, compr, at) = if name.as_str() == AN_EEPROM {
+                if AN_EEPROM_FIXED_OFF + raw.len() > AN_COMPACT_SIZE {
+                    return Err(format!(
+                        "{name} 有 {} 字节，放不进 0x{:06X} 起的固定区",
+                        raw.len(),
+                        AN_EEPROM_FIXED_OFF
+                    ));
+                }
+                max_end = max_end.max(AN_EEPROM_FIXED_OFF + raw.len());
+                (raw.clone(), 0u8, AN_EEPROM_FIXED_OFF)
             } else {
-                (raw.clone(), 0u8)
+                let packed = zlib(raw);
+                // 压缩收益不足 16 字节就原样存，省得白压一遍。
+                let (blob, compr) = if packed.len() + 16 < raw.len() {
+                    (packed, 1u8)
+                } else {
+                    (raw.clone(), 0u8)
+                };
+                if cursor + blob.len() > AN_EEPROM_FIXED_OFF {
+                    return Err(format!(
+                        "0x2000–0x{:06X} 区放不下：{name} 需要写到 0x{:06X}",
+                        AN_EEPROM_FIXED_OFF,
+                        cursor + blob.len()
+                    ));
+                }
+                let at = cursor;
+                cursor += blob.len();
+                max_end = max_end.max(cursor);
+                (blob, compr, at)
             };
-            if cursor + blob.len() > AN_COMPACT_SIZE {
-                return Err(format!(
-                    "载荷超出 2 MiB：{} 需要写到 0x{:06X}",
-                    name,
-                    cursor + blob.len()
-                ));
-            }
-            img[cursor..cursor + blob.len()].copy_from_slice(&blob);
+            img[at..at + blob.len()].copy_from_slice(&blob);
             let ent = AN_TOC_OFF + i * AN_TOC_ENTRY;
             let nb = name.as_bytes();
             let n = nb.len().min(AN_NAME_MAX - 1);
             img[ent..ent + n].copy_from_slice(&nb[..n]);
-            put_u32(&mut img, ent + AN_NAME_MAX, (cursor - AN_PAYLOAD_OFF) as u32);
+            put_u32(&mut img, ent + AN_NAME_MAX, (at - AN_PAYLOAD_OFF) as u32);
             put_u32(&mut img, ent + AN_NAME_MAX + 4, raw.len() as u32);
             put_u32(&mut img, ent + AN_NAME_MAX + 8, blob.len() as u32);
             img[ent + AN_NAME_MAX + 12] = compr;
-            cursor += blob.len();
         }
-        put_u32(&mut img, 0x18, (cursor - AN_PAYLOAD_OFF) as u32);
+        // 载荷长度取「最远写入位置」，固定区的 EEPROM 也算在内。
+        put_u32(&mut img, 0x18, (max_end - AN_PAYLOAD_OFF) as u32);
         Ok(img)
     }
 }
