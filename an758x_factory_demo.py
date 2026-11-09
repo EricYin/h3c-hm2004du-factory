@@ -647,8 +647,9 @@ def parse_volume(data):
 # SN/MAC 都在 `factory_conf` 里明文躺着，不需要从 AL-MAC 里反推。但也因此
 # 单机唯一数据（12 套 MAC、GPON SN/密码、BOSA 校准表、MT7993 EEPROM）体积
 # 达到 1.4 MB，其中 EEPROM 一个文件就 1.32 MiB —— 超过 1 MiB 镜像容量，
-# 所以镜像采用「头部身份 + TOC + zlib 载荷」的容器结构（EEPROM 压到 ~195
-# KiB）。容器长度按 2 MiB 规划（magic `AN4-2MiB`），旧版 1 MiB 容器仍可读入。
+# 所以镜像采用「头部身份 + TOC + 载荷」的容器结构。EEPROM 与 11 张 PON 校准
+# 表都放固定偏移、原样不压缩（可直接 hex 直读），只有 9 个配置文件仍 zlib。
+# 容器长度按 2 MiB 规划（magic `AN4-2MiB`），旧版 1 MiB 容器仍可读入。
 
 AN_UBI_PEB = 0x20000
 AN_UBI_VID_OFF = 0x800
@@ -661,6 +662,24 @@ AN_COMPACT_MAGIC_V1 = b"AN4-1MiB"      # 旧版 1 MiB 容器，仅用于读取�
 AN_COMPACT_SIZE_V1 = 0x100000
 # 2 MiB 容器里 EEPROM 的固定偏移（不压缩，方便直接用 hex 工具看校准区）。
 AN_EEPROM_FIXED_OFF = 0x40000
+# PON 校准表直读区：0x1A0000 起，每张 4 KiB 槽，原样不压缩。
+AN_CAL_FIXED_OFF = 0x1A0000
+AN_CAL_SLOT = 0x1000
+AN_CAL_TABLES = [
+    "10ge_asym_table", "10ge_sym_table",
+    "xg_table", "xgs_table",
+    "table", "olt_table",
+    "olt_bosa_apd_WTD01", "olt_bosa_apd_YS01",
+    "olt_bosa_info", "olt_bosa_rssi",
+    "LanOpticTxCalib",
+]
+
+
+def cal_offset(name):
+    """校准表名 -> 直读区偏移；不在槽表里返回 None（走压缩区）。"""
+    if name in AN_CAL_TABLES:
+        return AN_CAL_FIXED_OFF + AN_CAL_TABLES.index(name) * AN_CAL_SLOT
+    return None
 AN_COMPACT_VERSION = 1
 AN_TOC_OFF = 0x1000
 AN_PAYLOAD_OFF = 0x2000
@@ -1012,7 +1031,7 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
     img[AN_H_WIFI_2G4:AN_H_WIFI_2G4 + 6] = wifi_2g4
     img[AN_H_WIFI_5G:AN_H_WIFI_5G + 6] = wifi_5g
 
-    # EEPROM 走固定偏移、原样存；其余文件从 0x2000 起顺序压缩摆放。
+    # EEPROM 与 11 张 PON 校准表走固定偏移、原样存；其余配置文件从 0x2000 起压缩摆放。
     cursor = AN_PAYLOAD_OFF
     max_end = AN_PAYLOAD_OFF
     for idx, name in enumerate(names):
@@ -1022,6 +1041,14 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
                 raise ValueError("%s 有 %d 字节，放不进 0x%06X 起的固定区"
                                  % (name, len(raw), AN_EEPROM_FIXED_OFF))
             at, use, compr = AN_EEPROM_FIXED_OFF, raw, 0
+            max_end = max(max_end, at + len(use))
+        elif cal_offset(name) is not None:
+            # PON 校准表：固定槽 + 原样，槽内剩余保持 0xFF。
+            at = cal_offset(name)
+            if len(raw) > AN_CAL_SLOT:
+                raise ValueError("%s 有 %d 字节，超出 %d 字节的校准槽"
+                                 % (name, len(raw), AN_CAL_SLOT))
+            use, compr = raw, 0
             max_end = max(max_end, at + len(use))
         else:
             packed = zlib.compress(raw, 9)

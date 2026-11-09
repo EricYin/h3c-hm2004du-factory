@@ -939,8 +939,10 @@ impl Editor {
             });
 
         ui.add_space(8.0);
+        // 默认展开：用户打开 AN4475 最先想看的就是「每个文件在镜像哪个偏移」，
+        // 尤其 EEPROM 和 11 张 PON 校准表现在都能 hex 直读。
         egui::CollapsingHeader::new(format!("出厂文件（{} 个）", self.an.files.len()))
-            .default_open(false)
+            .default_open(true)
             .show(ui, |ui| {
                 egui::Grid::new("an_files")
                     .num_columns(3)
@@ -949,16 +951,19 @@ impl Editor {
                         for f in &self.an.files {
                             ui.monospace(f.name.as_str());
                             ui.monospace(format!("{} 字节", f.data.len()));
-                            if f.name == an4475::AN_EEPROM {
-                                // 2 MiB 容器里 EEPROM 不压缩、固定摆在这里：
-                                // 拿到镜像直接用 hex 工具按这个偏移就能看校准区。
-                                ui.weak(format!(
-                                    "镜像 0x{:06X} 起 · 未压缩",
-                                    an4475::AN_EEPROM_FIXED_OFF
-                                ));
+                            // 直读区的文件（EEPROM + 11 张 PON 校准表）都把
+                            // 镜像内偏移标出来，方便直接跳到 hex 里看。
+                            let at = if f.name == an4475::AN_EEPROM {
+                                Some(an4475::AN_EEPROM_FIXED_OFF)
                             } else {
-                                ui.label("");
-                            }
+                                an4475::cal_offset(&f.name)
+                            };
+                            match at {
+                                Some(off) => ui.weak(format!("镜像 0x{off:06X} 起 · 未压缩")),
+                                // 0 字节文件（factorymodeflag / wlan）压缩不压缩都一样。
+                                None if f.data.is_empty() => ui.weak("空文件"),
+                                None => ui.weak("压缩存放"),
+                            };
                             ui.end_row();
                         }
                     });
@@ -966,11 +971,17 @@ impl Editor {
 
         ui.add_space(8.0);
         ui.weak("mtd9 = 整个 UBI 设备（25 MiB / 200 个 128 KiB PEB），只有一个动态卷 fhdata（178 LEB），卷上是 UBIFS。");
-        ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，其余文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
+        ui.weak("2 MiB 镜像用专属 magic `AN4-2MiB`：头部固定偏移放身份，EEPROM 与 11 张 PON 校准表放固定槽原样存，只有 9 个配置文件进 TOC + zlib 载荷；旧版 `AN4-1MiB` 仍可读入，导出时自动升级。");
         ui.weak(format!(
-            "Wi-Fi 校准（MT7993_EEPROM.bin，1 353 728 字节）在镜像里固定放在 0x{:06X}、原样不压缩，可直接用 hex 工具打开；设备 ID 应为 0x7993。",
+            "Wi-Fi 校准（MT7993_EEPROM.bin，1 353 728 字节）固定放在 0x{:06X}、原样不压缩，可直接用 hex 工具打开；设备 ID 应为 0x7993。",
             an4475::AN_EEPROM_FIXED_OFF
         ));
+        ui.weak(format!(
+            "PON 校准表直读区 0x{:06X} 起，每张一个 4 KiB 槽、原样不压缩（槽号 × 0x1000）：",
+            an4475::AN_CAL_FIXED_OFF
+        ));
+        ui.weak("  +0x0000 10ge_asym / +0x1000 10ge_sym / +0x2000 xg / +0x3000 xgs / +0x4000 table / +0x5000 olt_table");
+        ui.weak("  +0x6000 olt_bosa_apd_WTD01 / +0x7000 olt_bosa_apd_YS01 / +0x8000 olt_bosa_info / +0x9000 olt_bosa_rssi / +0xA000 LanOpticTxCalib");
         ui.weak("身份字段（SN / MAC / GPON SN / 密码）导出时会回写 factory_conf，保持文本与头部一致。");
         ui.weak("导入时按 sqnum 取 UBIFS 每个 key 的最新副本；`.factory_conf.uci-*` 是写入中间态，自动跳过。");
     }
@@ -1152,7 +1163,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.4.0",
+        "AN758X Factory 编辑器 v0.5.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

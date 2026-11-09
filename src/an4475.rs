@@ -37,8 +37,9 @@
 //! `MT7993_EEPROM.bin` 一个文件就 1.32 MiB —— 直接摆进 1 MiB 会溢出。
 //!
 //! 因此这里用自描述的容器：**头部固定偏移放身份字段**（消费方不解析 TOC 也能
-//! 直接读到 SN/MAC），**TOC + zlib 载荷放其余全部文件**。EEPROM 压到约
-//! 195 KiB，整包约 211 KiB，2 MiB 余量非常充足（载荷只用掉约 10%）。
+//! 直接读到 SN/MAC），**EEPROM 与 11 张 PON 校准表各占固定槽、原样不压缩**
+//! （都能被 hex 工具直接读），只有 9 个配置文件进 zlib 载荷。整包实际占用
+//! 1.66 MiB，2 MiB 里还剩约 340 KiB 空闲。
 //!
 //! ```text
 //! 0x000000  8   magic "AN4-2MiB"（旧镜像为 "AN4-1MiB"，同样可读）
@@ -56,8 +57,12 @@
 //! 0x000051  10  GPON 密码（ASCII）
 //! 0x000060  54  派生 MAC 9 项：internet/tr069/voip/priprotocol + eth1..eth5
 //! 0x001000      TOC，每项 48 字节（名 32 + off/raw/stored 各 4 + 压缩标志 1）
-//! 0x002000      TOC 之外的其余 20 个文件（zlib 或原样，顺序摆放）
+//! 0x002000      其余 9 个配置文件（zlib 或原样，顺序压缩摆放）
 //! 0x040000      MT7993_EEPROM.bin 原样存放（1 353 728 B，未压缩）
+//! 0x18A800      EEPROM 结束
+//! 0x1A0000      11 张 PON 校准表的直读区（每张 4 KiB 槽，原样不压缩）
+//!               槽序见 AN_CAL_TABLES：0x1A0000 + 槽号 × 0x1000
+//! 0x1AB000      直读区结束
 //! ---------- 其余至 0x200000 全 0xFF ----------
 //! ```
 //!
@@ -137,6 +142,41 @@ pub const AN_EEPROM: &str = "MT7993_EEPROM.bin";
 /// 容器本来就有富余。固定摆在这里、原样存储，拿到镜像的人可以直接用 hex
 /// 工具按 `0x40000` 打开看校准区，不必先解压；工具导出/写回也走同一份字节。
 pub const AN_EEPROM_FIXED_OFF: usize = 0x40000;
+
+/// PON 校准表的**直读区**起点：`0x1A0000`（1.625 MiB，128 KiB 对齐）。
+///
+/// 与 EEPROM 同样处理 —— 原样存放、不压缩，拿 hex 工具按槽偏移就能看。
+/// 放在 EEPROM 之后（EEPROM 占 `0x40000–0x18A800`），前面留 86 KiB 缓冲，
+/// 后面到 `0x200000` 还剩 340 KiB。
+pub const AN_CAL_FIXED_OFF: usize = 0x1A0000;
+/// 每张校准表占一个 4 KiB 槽（实测最大 2048 B，留一倍余量）。
+pub const AN_CAL_SLOT: usize = 0x1000;
+
+/// 直读区的槽位顺序（下标即槽号，偏移 = `0x1A0000 + 槽号 × 0x1000`）。
+///
+/// 顺序按用途分组排，方便记：10G 收发 → 通用/OLT 表 → OLT BOSA → 光口 TX。
+/// 名字必须与 `fhdata` 卷里的一致，否则会落回压缩区。
+pub const AN_CAL_TABLES: [&str; 11] = [
+    "10ge_asym_table",
+    "10ge_sym_table",
+    "xg_table",
+    "xgs_table",
+    "table",
+    "olt_table",
+    "olt_bosa_apd_WTD01",
+    "olt_bosa_apd_YS01",
+    "olt_bosa_info",
+    "olt_bosa_rssi",
+    "LanOpticTxCalib",
+];
+
+/// 校准表名 → 直读区偏移；不是固定槽里的表就返回 `None`（走压缩区）。
+pub fn cal_offset(name: &str) -> Option<usize> {
+    AN_CAL_TABLES
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| AN_CAL_FIXED_OFF + i * AN_CAL_SLOT)
+}
 
 // Wi-Fi EEPROM 头很短：device id + 版本 + 两个 MAC，0x10..0x190 全 0，
 // 0x190 起才是射频校准表。出厂值仍是芯片厂默认（2.4G/5G 分别
@@ -352,6 +392,17 @@ impl An4475 {
                 }
                 max_end = max_end.max(AN_EEPROM_FIXED_OFF + raw.len());
                 (raw.clone(), 0u8, AN_EEPROM_FIXED_OFF)
+            } else if let Some(at) = cal_offset(name) {
+                // PON 校准表：固定槽 + 原样，槽内剩余保持 0xFF。
+                if raw.len() > AN_CAL_SLOT {
+                    return Err(format!(
+                        "{name} 有 {} 字节，超出 {} 字节的校准槽",
+                        raw.len(),
+                        AN_CAL_SLOT
+                    ));
+                }
+                max_end = max_end.max(at + raw.len());
+                (raw.clone(), 0u8, at)
             } else {
                 let packed = zlib(raw);
                 // 压缩收益不足 16 字节就原样存，省得白压一遍。
