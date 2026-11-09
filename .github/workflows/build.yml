@@ -1,4 +1,4 @@
-name: Build h3c-factory
+name: Build an758x-factory
 
 on:
   push:
@@ -20,11 +20,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: Package
-        run: Compress-Archive -Path target/release/h3c-factory.exe -DestinationPath h3c-factory-windows-x86_64.zip
+        run: Compress-Archive -Path target/release/an758x-factory.exe -DestinationPath an758x-factory-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: h3c-factory-windows-x86_64
-          path: h3c-factory-windows-x86_64.zip
+          name: an758x-factory-windows-x86_64
+          path: an758x-factory-windows-x86_64.zip
           if-no-files-found: error
 
   macos:
@@ -34,11 +34,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: Package
-        run: tar -C target/release -czf h3c-factory-macos.tar.gz h3c-factory
+        run: tar -C target/release -czf an758x-factory-macos.tar.gz an758x-factory
       - uses: actions/upload-artifact@v4
         with:
-          name: h3c-factory-macos
-          path: h3c-factory-macos.tar.gz
+          name: an758x-factory-macos
+          path: an758x-factory-macos.tar.gz
           if-no-files-found: error
 
   linux:
@@ -58,12 +58,12 @@ jobs:
         run: cargo build --release --features linux-x11
       - name: Package
         run: |
-          cp target/release/h3c-factory h3c-factory-x86_64-linux
-          tar -czf h3c-factory-x86_64-linux.tar.gz h3c-factory-x86_64-linux
+          cp target/release/an758x-factory an758x-factory-x86_64-linux
+          tar -czf an758x-factory-x86_64-linux.tar.gz an758x-factory-x86_64-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: h3c-factory-linux-x86_64
-          path: h3c-factory-x86_64-linux.tar.gz
+          name: an758x-factory-linux-x86_64
+          path: an758x-factory-x86_64-linux.tar.gz
           if-no-files-found: error
 
   release:
