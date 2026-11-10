@@ -912,7 +912,80 @@ impl Editor {
         ));
 
         ui.add_space(6.0);
-        // mt76 只需要 7 680 B，厂商文件却是 1 353 728 B —— 这个折叠区专门解释
+        // PON 侧只读视图。校准包能证实的只有「模式编码 + BOSA 型号 + 表版本」：
+        // PON MAC 在 SoC 里，数据中没有型号字段，所以这里如实写「SoC 内置」，
+        // 不假装读到了器件型号（H3C 那台能读到 EN7572 明文，本机没有）。
+        egui::CollapsingHeader::new("PON / 光组件（只读）")
+            .default_open(true)
+            .show(ui, |ui| {
+                let tables = self.an.cal_tables();
+                egui::Grid::new("an_pon_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 3.0])
+                    .show(ui, |ui| {
+                        ui.label("PON 主芯片");
+                        ui.monospace("AN7581（SoC 内置 PON MAC · 校准包无型号字段）");
+                        ui.end_row();
+
+                        ui.label("光组件 BOSA");
+                        ui.monospace(if self.an.bosa.is_empty() {
+                            "<未读到 olt_bosa_info>".to_string()
+                        } else {
+                            self.an.bosa.clone()
+                        });
+                        ui.end_row();
+
+                        ui.label("PON 模式");
+                        ui.monospace(format!(
+                            "pon_mode={} · uplink_mode={}（原厂编码）",
+                            if self.an.pon_mode.is_empty() {
+                                "—"
+                            } else {
+                                &self.an.pon_mode
+                            },
+                            if self.an.uplink_mode.is_empty() {
+                                "—"
+                            } else {
+                                &self.an.uplink_mode
+                            }
+                        ));
+                        ui.end_row();
+
+                        ui.label("校准表");
+                        ui.monospace(format!(
+                            "{} 张 / {} 个固定槽",
+                            tables.len(),
+                            an4475::AN_CAL_TABLES.len()
+                        ));
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                egui::Grid::new("an_pon_tables")
+                    .num_columns(4)
+                    .spacing([16.0, 2.0])
+                    .show(ui, |ui| {
+                        for t in &tables {
+                            ui.monospace(t.name.as_str());
+                            ui.monospace(format!("0x{:06X}", t.offset));
+                            ui.monospace(format!("{} B", t.size));
+                            let mut note = t.version.clone().unwrap_or_else(|| "—".to_string());
+                            if let Some(same) = &t.same_as {
+                                note.push_str(&format!(" · 同 {same}"));
+                            }
+                            ui.weak(note);
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(4.0);
+                ui.weak("「上行」在本机只有一个方向：PON MAC 在 AN7581 内，外部只有一颗 BOSA（olt_bosa_info → olt_bosa_id）。");
+                ui.weak("olt_table / olt_bosa_apd_* / olt_bosa_rssi 按表名与内容是局端（OLT）侧 BOSA 的 APD 偏压-温度 / RSSI / 型号参数，产线校准工具两种形态共用，不代表本机有第二颗下行 PON 芯片。");
+                ui.weak("10ge_sym / xgs / table 三份逐字节相同：对称 10G 与通用模式复用同一份 BOB 校准；10ge_asym 与 xg 各自独立。");
+            });
+
+        ui.add_space(6.0);
+        // mt76 只需要 7 680 B，厂商文件却是 1 353 728 B —— 下面这个折叠区专门解释
         // 两者关系并给出成品，省得用户自己在 1.3 MB 里找偏移。
         egui::CollapsingHeader::new("mt76 / OpenWrt EEPROM（7 680 B）")
             .default_open(false)
@@ -1065,6 +1138,24 @@ impl Editor {
                     ui.end_row();
                 }
             });
+
+        // 唯一性自检：12 个地址里有重复就红字点名。原厂规则本身不冲突，
+        // 但字段可手改，改错会让同一地址挂在两个接口上（交换机学表来回跳）。
+        // 用输入框里的字符串实时解析：apply_to_an() 只在导出/失去焦点时跑，
+        // 若读 self.an 的值，改完输入框要等一步才提示，容易让人以为没检查。
+        let w24 = an4475::parse_mac(&self.wifi_2g4).unwrap_or(self.an.wifi_2g4);
+        let w5 = an4475::parse_mac(&self.wifi_5g).unwrap_or(self.an.wifi_5g);
+        let conflicts = an4475::mac_conflicts_of(&base, &eth, &w24, &w5);
+        if conflicts.is_empty() {
+            ui.weak("12 个地址互不重复：D4:9F 段用基准 +1/+2/+3/+8，D4:A0 段用 Wi-Fi 50/58 与 LAN 71–75。");
+        } else {
+            for (mac, users) in &conflicts {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xB3, 0x26, 0x1E),
+                    format!("MAC 冲突：{mac} 同时用于 {}", users.join(" / ")),
+                );
+            }
+        }
 
         ui.add_space(8.0);
         // 默认展开：用户打开 AN4475 最先想看的就是「每个文件在镜像哪个偏移」，
@@ -1379,7 +1470,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.8.0",
+        "AN758X Factory 编辑器 v0.8.2",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

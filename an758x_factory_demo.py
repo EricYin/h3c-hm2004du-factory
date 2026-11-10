@@ -676,6 +676,20 @@ AN_CAL_TABLES = [
 ]
 
 
+# BOB 校准表头：`fiberhomebdbob` + 16 字节版本戳（如 202404291559VB）。
+AN_BOB_MAGIC = b"fiberhomebdbob"
+AN_BOB_VERSION_OFF = 0x10
+
+
+def an4475_bob_version(data):
+    """BOB 表头里的版本戳；不是 BOB 表（或长度不够）返回 None。"""
+    if len(data) < AN_BOB_VERSION_OFF + 16 or not data.startswith(AN_BOB_MAGIC):
+        return None
+    raw = data[AN_BOB_VERSION_OFF:AN_BOB_VERSION_OFF + 16]
+    txt = raw.split(b"\x00")[0].decode("ascii", "ignore").strip()
+    return txt or None
+
+
 def cal_offset(name):
     """校准表名 -> 直读区偏移；不在槽表里返回 None（走压缩区）。"""
     if name in AN_CAL_TABLES:
@@ -784,6 +798,32 @@ def an4475_wifi_defaults(base_mac):
     """Wi-Fi 两位 MAC 的默认值，按原厂 fac_start_wifi.sh 的派生规则算。"""
     return (an4475_wifi_mac(base_mac, False),
             an4475_wifi_mac(base_mac, True))
+
+
+def an4475_mac_conflicts(base_mac, eth_mac, wifi_2g4, wifi_5g):
+    """12 个出厂 MAC 的重复检查，返回 [(mac, [用途...])]，只列出现 ≥2 次的。
+
+    全 0 / 全 FF 的段整段跳过：基址没填时派生出来的 :01/:02 会互撞，那是
+    「还没输入」，不该报成地址规划问题。
+    """
+    def filled(m):
+        return m not in (b"\x00" * 6, b"\xff" * 6)
+
+    items = []
+    if filled(base_mac):
+        items.append((base_mac, "基准 MAC"))
+        items += [(_mac_add(base_mac, off), name) for name, off in AN_DERIVED]
+    if filled(eth_mac):
+        items += [(_mac_add(eth_mac, i), name) for i, name in enumerate(AN_ETH_NAMES)]
+    if filled(wifi_2g4):
+        items.append((wifi_2g4, "Wi-Fi 2.4G"))
+    if filled(wifi_5g):
+        items.append((wifi_5g, "Wi-Fi 5G"))
+
+    seen = {}
+    for mac, name in items:
+        seen.setdefault(mac_to_string(mac), []).append(name)
+    return [(m, u) for m, u in seen.items() if len(u) > 1]
 
 
 def an4475_eeprom_device_id(eeprom):
@@ -1106,6 +1146,8 @@ def parse_an4475_mtd9(data):
         "vendor": _uci_get(text, "VendorCode"),
         "bosa": _uci_get(files.get("olt_bosa_info", b"").decode("utf-8", "ignore"),
                          "olt_bosa_id"),
+        "pon_mode": _uci_get(text, "pon_mode"),
+        "uplink_mode": _uci_get(text, "uplink_mode"),
         "files": files,
     }
 
@@ -1242,6 +1284,12 @@ def parse_an4475_compact(data):
         "wifi_2g4": wifi_2g4,
         "wifi_5g": wifi_5g,
         "eeprom_device_id": an4475_eeprom_device_id(files.get(AN_WLAN_EEPROM, b"")),
+        "bosa": _uci_get(files.get("olt_bosa_info", b"").decode("utf-8", "ignore"),
+                         "olt_bosa_id"),
+        "pon_mode": _uci_get(files.get("factory_conf", b"").decode("utf-8", "ignore"),
+                             "pon_mode"),
+        "uplink_mode": _uci_get(files.get("factory_conf", b"").decode("utf-8", "ignore"),
+                                "uplink_mode"),
         "files": files,
     }
 
@@ -1453,6 +1501,17 @@ def main():
                 if devid != 0x7993:
                     print("    警告: device id 0x%04X != 0x7993，可能不是 MT7990AN"
                           % devid)
+            bosa = info.get("bosa") or "-"
+            print("  PON       : BOSA %s · pon_mode=%s · uplink_mode=%s"
+                  % (bosa, info.get("pon_mode") or "-",
+                     info.get("uplink_mode") or "-"))
+            for name in AN_CAL_TABLES:
+                blob = files.get(name)
+                if blob is None:
+                    continue
+                print("    %-22s %6d B  0x%06X  %s"
+                      % (name, len(blob), cal_offset(name),
+                         an4475_bob_version(blob) or "-"))
             print("  出厂文件  : %d 个，共 %d 字节"
                   % (len(files), sum(len(v) for v in files.values())))
             for name in sorted(files):
@@ -1496,6 +1555,8 @@ def main():
             print("  5G MAC    : %s%s"
                   % (mac_to_string(wifi5g or d5g),
                      "" if wifi5g else "（原厂规则：第 2 字节 +1、末字节 +8）"))
+            for m, users in an4475_mac_conflicts(base, eth, wifi24 or d24, wifi5g or d5g):
+                print("    ! MAC 冲突: %s 同时用于 %s" % (m, " / ".join(users)))
         if args.out:
             if not (sn and base and eth and files):
                 sys.exit("生成 2 MiB 需要 --bin 提供出厂文件与身份"

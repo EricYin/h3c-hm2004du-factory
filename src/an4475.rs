@@ -136,6 +136,12 @@ pub const AN_H_WIFI_5G: usize = 0x9c;
 pub const AN_MAIN_CONF: &str = "factory_conf";
 /// Wi-Fi 校准文件名（1.32 MiB，容器里必须压缩存放）。
 pub const AN_EEPROM: &str = "MT7993_EEPROM.bin";
+/// 光组件（BOSA）信息表：`olt_bosa_id` 等三项 UCI 文本，唯一的型号来源。
+pub const AN_BOSA_INFO: &str = "olt_bosa_info";
+/// BOB 校准表的文件头魔数：`fiberhomebdbob` + 16 字节版本戳（如 `202404291559VB`）。
+pub const AN_BOB_MAGIC: &[u8; 14] = b"fiberhomebdbob";
+/// 版本戳在 BOB 头里的偏移（魔数 14 B + 2 B 对齐填充）。
+pub const AN_BOB_VERSION_OFF: usize = 0x10;
 
 /// 2 MiB 容器里 Wi-Fi EEPROM 的**固定偏移**，且不压缩。
 ///
@@ -445,10 +451,119 @@ pub struct AnFile {
     pub data: Vec<u8>,
 }
 
+/// 从文件表里取 BOSA 型号（`olt_bosa_info` → `olt_bosa_id`）。
+///
+/// 这是整份校准包里**唯一**的光组件型号来源：`10ge_*` / `xg*` / `table` 这些
+/// BOB 表只有魔数和版本戳，没有器件型号。两种入口（mtd9 / 2 MiB 容器）都走
+/// 这里，免得从容器读入时 BOSA 一栏莫名消失。
+pub fn bosa_from_files(files: &[AnFile]) -> String {
+    files
+        .iter()
+        .find(|f| f.name == AN_BOSA_INFO)
+        .map(|f| String::from_utf8_lossy(&f.data).to_string())
+        .and_then(|t| uci_get(&t, "olt_bosa_id"))
+        .unwrap_or_default()
+}
+
+/// 从 `factory_conf` 里取一个 UCI 键（`pon_mode` / `uplink_mode` 等）。
+fn conf_value(files: &[AnFile], key: &str) -> String {
+    files
+        .iter()
+        .find(|f| f.name == AN_MAIN_CONF)
+        .map(|f| String::from_utf8_lossy(&f.data).to_string())
+        .and_then(|t| uci_get(&t, key))
+        .unwrap_or_default()
+}
+
+/// BOB 校准表头里的版本戳（`fiberhomebdbob` 后 16 字节，如 `202404291559VB`）。
+///
+/// 不是 BOB 表（或长度不够）时返回 `None`，这样界面上不会把配置文件
+/// 当成校准表显示版本。
+pub fn bob_version(data: &[u8]) -> Option<String> {
+    if data.len() < AN_BOB_VERSION_OFF + 16 || !data.starts_with(AN_BOB_MAGIC) {
+        return None;
+    }
+    let s: String = data[AN_BOB_VERSION_OFF..AN_BOB_VERSION_OFF + 16]
+        .iter()
+        .take_while(|b| **b != 0 && b.is_ascii_graphic())
+        .map(|b| *b as char)
+        .collect();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 12 个出厂 MAC（基准 + 4 个网络侧派生 + 5 个 LAN + 2 个 Wi-Fi）的重复检查。
+///
+/// 返回 `(MAC, 用到它的字段列表)`，只列出现 ≥2 次的地址。全 0 / 全 FF 视为
+/// 「没填」，不算冲突 —— 那种情况该由输入校验挡，不是地址规划问题。
+pub fn mac_conflicts_of(
+    base: &[u8; 6],
+    eth: &[u8; 6],
+    wifi_2g4: &[u8; 6],
+    wifi_5g: &[u8; 6],
+) -> Vec<(String, Vec<String>)> {
+    // 未填的段（全 0 / 全 FF）整段跳过：基址没填时派生出来的 :01/:02 会互撞，
+    // 那是「还没输入」，不是地址规划问题，报出来只会盖住真正的冲突。
+    let filled = |m: &[u8; 6]| *m != [0u8; 6] && *m != [0xff; 6];
+
+    let mut items: Vec<(String, String)> = Vec::new();
+    if filled(base) {
+        items.push((mac_to_string(base), "基准 MAC".to_string()));
+        for (name, off) in AN_DERIVED {
+            items.push((mac_to_string(&mac_add(base, off)), name.to_string()));
+        }
+    }
+    if filled(eth) {
+        for (i, name) in AN_ETH_NAMES.iter().enumerate() {
+            items.push((mac_to_string(&mac_add(eth, i as u8)), (*name).to_string()));
+        }
+    }
+    if filled(wifi_2g4) {
+        items.push((mac_to_string(wifi_2g4), "Wi-Fi 2.4G".to_string()));
+    }
+    if filled(wifi_5g) {
+        items.push((mac_to_string(wifi_5g), "Wi-Fi 5G".to_string()));
+    }
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for (mac, user) in items {
+        match out.iter_mut().find(|(m, _)| *m == mac) {
+            Some((_, users)) => users.push(user),
+            None => out.push((mac, vec![user])),
+        }
+    }
+    out.retain(|(_, users)| users.len() > 1);
+    out
+}
+
+/// 空字符串显示成 `—`，避免界面上出现「pon_mode=」这种半截话。
+fn or_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "—"
+    } else {
+        s
+    }
+}
+
+/// 直读区里一张 PON 校准表的展示信息（只读，不改字节）。
+pub struct CalTableInfo {
+    pub name: String,
+    /// 镜像内偏移 = `AN_CAL_FIXED_OFF + 槽号 × 0x1000`。
+    pub offset: usize,
+    pub size: usize,
+    /// BOB 头里的版本戳；非 BOB 表为 `None`。
+    pub version: Option<String>,
+    /// 与它逐字节相同的另一张表。实机上 `10ge_sym_table` / `xgs_table` /
+    /// `table` 三份内容完全一致 —— 对称 10G 与通用模式复用同一份校准。
+    pub same_as: Option<String>,
+}
+
 /// AN4475 的可编辑状态。
 #[derive(Clone)]
-pub struct An4475 {
-    pub device_sn: String,
+pub struct An4475 {    pub device_sn: String,
     pub gpon_sn: [u8; 8],
     pub gpon_pw: String,
     pub base_mac: [u8; 6],
@@ -461,7 +576,12 @@ pub struct An4475 {
     pub eeprom_id: u16,
     pub vendor: String,
     /// BOSA 型号，来自 `olt_bosa_info` 的 `olt_bosa_id`（真机 WTD01）。
+    /// 这是校准包里**唯一**的光组件型号来源；PON MAC 在 SoC 内，没有型号字段。
     pub bosa: String,
+    /// PON 模式（`factory_conf` 的 `pon_mode`，真机 7，原厂编码，含义未公开）。
+    pub pon_mode: String,
+    /// 上联模式（`factory_conf` 的 `uplink_mode`，真机 4）。
+    pub uplink_mode: String,
     pub files: Vec<AnFile>,
 }
 
@@ -484,6 +604,8 @@ impl An4475 {
             eeprom_id: 0,
             vendor: "FH".to_string(),
             bosa: String::new(),
+            pon_mode: String::new(),
+            uplink_mode: String::new(),
             files: Vec::new(),
         }
     }
@@ -519,6 +641,48 @@ impl An4475 {
         self.files.iter().map(|f| f.data.len()).sum()
     }
 
+    /// 11 张固定槽校准表的展示信息，按槽号顺序；容器里没有的表跳过。
+    ///
+    /// 只读用途：界面上的「PON / 光组件」块靠它列出表名、偏移、版本戳，
+    /// 以及哪几张内容完全相同（真机上 3 张共用一份）。
+    pub fn cal_tables(&self) -> Vec<CalTableInfo> {
+        AN_CAL_TABLES
+            .iter()
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let f = self.files.iter().find(|f| &f.name == name)?;
+                // 只跟**槽号更小**的表比，这样三份相同的表统一报「同最早那张」，
+                // 不会出现 A 指向 B、B 又指向 C 的绕圈。
+                let same_as = AN_CAL_TABLES
+                    .iter()
+                    .take(i)
+                    .find(|other| {
+                        self.files
+                            .iter()
+                            .any(|o| o.name == **other && o.data == f.data && !o.data.is_empty())
+                    })
+                    .map(|other| (*other).to_string());
+                Some(CalTableInfo {
+                    name: (*name).to_string(),
+                    offset: AN_CAL_FIXED_OFF + i * AN_CAL_SLOT,
+                    size: f.data.len(),
+                    version: bob_version(&f.data),
+                    same_as,
+                })
+            })
+            .collect()
+    }
+
+    /// 镜像内 12 个 MAC 的重复检查，返回 `(MAC, 用到它的字段列表)`。
+    ///
+    /// 一、原厂规则本身不重复：`D4:9F` 段用 50–53/58，`D4:A0` 段用 50/58（Wi-Fi）
+    /// 和 71–75（LAN），两段前缀不同、同段内部也不撞。二、但这些字段都能手改，
+    /// 改错就会出现「同一地址挂在两个接口上」——交换机 MAC 表在两端口间来回学，
+    /// 表现为丢包/闪断。所以这里按「同地址出现 ≥2 次」列出来，交界面提示。
+    pub fn mac_conflicts(&self) -> Vec<(String, Vec<String>)> {
+        mac_conflicts_of(&self.base_mac, &self.eth_mac, &self.wifi_2g4, &self.wifi_5g)
+    }
+
     pub fn summary(&self) -> String {
         let mut s = String::new();
         s.push_str("机型       : AN4475 (10G PON)\n");
@@ -542,6 +706,13 @@ impl An4475 {
         }
         if !self.bosa.is_empty() {
             s.push_str(&format!("BOSA       : {}\n", self.bosa));
+        }
+        if !self.pon_mode.is_empty() || !self.uplink_mode.is_empty() {
+            s.push_str(&format!(
+                "PON 模式   : pon_mode={} uplink_mode={}（原厂编码）\n",
+                or_dash(&self.pon_mode),
+                or_dash(&self.uplink_mode)
+            ));
         }
         s.push_str(&format!(
             "出厂文件   : {} 个，原始共 {} 字节\n",
@@ -773,7 +944,9 @@ pub fn parse_compact(data: &[u8]) -> Option<An4475> {
         wifi_5g,
         eeprom_id,
         vendor: read_ascii(&data[AN_H_VENDOR..AN_H_VENDOR + 2]),
-        bosa: String::new(),
+        bosa: bosa_from_files(&files),
+        pon_mode: conf_value(&files, "pon_mode"),
+        uplink_mode: conf_value(&files, "uplink_mode"),
         files,
     })
 }
@@ -790,10 +963,6 @@ pub fn parse_mtd9(data: &[u8]) -> Option<An4475> {
         .unwrap_or_default();
     let gpon_hex = uci_get(&conf, "GponSN").unwrap_or_default();
     let pw_hex = uci_get(&conf, "GPONPassWord").unwrap_or_default();
-    let bosa_conf = files
-        .get("olt_bosa_info")
-        .map(|v| String::from_utf8_lossy(v).to_string())
-        .unwrap_or_default();
 
     let mut gpon_sn = [0xffu8; 8];
     if let Some(v) = parse_hex(&gpon_hex) {
@@ -849,7 +1018,9 @@ pub fn parse_mtd9(data: &[u8]) -> Option<An4475> {
         wifi_5g,
         eeprom_id,
         vendor: uci_get(&conf, "VendorCode").unwrap_or_else(|| "FH".to_string()),
-        bosa: uci_get(&bosa_conf, "olt_bosa_id").unwrap_or_default(),
+        bosa: bosa_from_files(&list),
+        pon_mode: conf_value(&list, "pon_mode"),
+        uplink_mode: conf_value(&list, "uplink_mode"),
         files: list,
     })
 }
@@ -1317,5 +1488,64 @@ mod tests {
             &MT76_DEFAULT_IPA[MT_EE_TX0_POWER_2G..MT_EE_TX0_POWER_2G + 16]
         );
         assert!(mt76_diff(&ee, &bin).0 <= 10);
+    }
+    /// BOB 头解析：真实版本戳能读出来，非 BOB 文件一律 None（否则界面上
+    /// 配置文件也会显示「版本」）。
+    #[test]
+    fn bob_header() {
+        let mut t = vec![0u8; 2048];
+        t[..14].copy_from_slice(b"fiberhomebdbob");
+        t[0x10..0x1e].copy_from_slice(b"202404291559VB");
+        assert_eq!(bob_version(&t).as_deref(), Some("202404291559VB"));
+        assert_eq!(bob_version(b"config key 'x'"), None);
+        assert_eq!(bob_version(&[0xff; 2048]), None);
+    }
+
+    /// 三份内容相同的表只报「同最早那张」，且 BOSA 型号能从 UCI 文本里取到。
+    #[test]
+    fn cal_tables_same_as() {
+        let mut a = An4475::new();
+        let mut bob = vec![0u8; 2048];
+        bob[..14].copy_from_slice(b"fiberhomebdbob");
+        bob[0x10..0x1e].copy_from_slice(b"202404291559VB");
+        let mk = |n: &str, d: Vec<u8>| AnFile {
+            name: n.to_string(),
+            data: d,
+        };
+        a.files = vec![
+            mk("10ge_asym_table", vec![0xaa; 2048]),
+            mk("10ge_sym_table", bob.clone()),
+            mk("xg_table", vec![0xbb; 2048]),
+            mk("xgs_table", bob.clone()),
+            mk("table", bob),
+            mk("olt_bosa_info", b"config key 'olt_bosa_id'\n    option value 'WTD01'\n".to_vec()),
+        ];
+        let t = a.cal_tables();
+        assert_eq!(t.len(), 6);
+        assert_eq!(t[1].same_as, None);
+        assert_eq!(t[3].same_as.as_deref(), Some("10ge_sym_table"));
+        assert_eq!(t[4].same_as.as_deref(), Some("10ge_sym_table"));
+        assert_eq!(t[0].same_as, None);
+        assert_eq!(bosa_from_files(&a.files), "WTD01");
+    }
+    /// 原厂分配方案本身不冲突；手改撞车时必须被点名。
+    #[test]
+    fn mac_conflict_detect() {
+        let base = [0xd4, 0x9f, 0x29, 0x04, 0xe7, 0x50];
+        let eth = [0xd4, 0xa0, 0x29, 0x04, 0xe7, 0x71];
+        let w24 = an_wifi_mac(&base, false);
+        let w5 = an_wifi_mac(&base, true);
+        assert!(mac_conflicts_of(&base, &eth, &w24, &w5).is_empty());
+
+        // 把 2.4G 改成 LAN 第一个地址：应该正好抓到 eth1mac 与 Wi-Fi 2.4G 撞车。
+        let bad = [0xd4, 0xa0, 0x29, 0x04, 0xe7, 0x71];
+        let c = mac_conflicts_of(&base, &eth, &bad, &w5);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, "D4:A0:29:04:E7:71");
+        assert!(c[0].1.contains(&"eth1mac".to_string()));
+        assert!(c[0].1.contains(&"Wi-Fi 2.4G".to_string()));
+
+        // 全 0 是「没填」，不算冲突。
+        assert!(mac_conflicts_of(&[0; 6], &[0; 6], &[0; 6], &[0; 6]).is_empty());
     }
 }
