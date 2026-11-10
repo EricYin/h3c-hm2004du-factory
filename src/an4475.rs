@@ -177,9 +177,14 @@ pub const AN_CAL_TABLES: [&str; 11] = [
     "LanOpticTxCalib",
 ];
 
+/// `AN_CAL_TABLES` 的前 6 个是 **BDBOB 格式的 PON 校准表**；其余 5 个是 APD 偏压、
+/// BOSA 信息、RSSI 与光口 TX 校准（UCI 文本或裸二进制），不参与 APONCAL 转换。
+///
+/// 顺序：5 张上行（10ge_asym / 10ge_sym / xg / xgs / table）+ 1 张下行（olt_table）。
+pub const AN_BOB_TABLES: usize = 6;
+
 /// 校准表名 → 直读区偏移；不是固定槽里的表就返回 `None`（走压缩区）。
-pub fn cal_offset(name: &str) -> Option<usize> {
-    AN_CAL_TABLES
+pub fn cal_offset(name: &str) -> Option<usize> {    AN_CAL_TABLES
         .iter()
         .position(|n| *n == name)
         .map(|i| AN_CAL_FIXED_OFF + i * AN_CAL_SLOT)
@@ -591,6 +596,256 @@ pub fn mac_conflicts_of(
     out
 }
 
+// ===== PON 校准表 → APONCAL（与上游 fiberhome-factory 同语义）=====
+//
+// 上游只处理**一张**表：读 `fhdata/table`，`validate_bdbob()` 校验长度/魔数/
+// 两处 CRC，`convert_bdbob()` 按头 0x30 的 chip id 映射成 GN28L95 或 UX3363，
+// `encode_pon_calibration()` 重封成 2048 B 的 APONCAL 容器。
+//
+// AN4475 有 6 个 PON 槽，所以这里把同一套流程做成「逐槽跑一遍」。同时把上游
+// 隐含假设、但本机并不成立的两件事显式化：
+//
+//   1. **CRC 种子有两套**。上游固定用 `crc32_register(d, 0) ^ !0`（u-boot 口径），
+//      而本机 `10ge_asym_table` / `xg_table` / `olt_table` 是标准 zlib 口径
+//      （`crc32_register(d, !0) ^ !0`）。严格照抄会判一半的表 CRC 失败，所以
+//      先按上游种子验，不过再按标准种子验，并把实际命中的那套报出来。
+//   2. **chip id 0x27 不在 APONCAL 枚举里**。枚举只有 1=GN28L95、2=UX3363，
+//      PonWrt 的 `bosa_load_calibration()` 也只认这两个值。下行 `olt_table`
+//      因此判 `ChipUnsupported`，不臆造一个值去糊弄驱动。
+
+/// APONCAL 容器魔数（8 B，含结尾 NUL）。
+pub const PON_CAL_MAGIC: &[u8; 8] = b"APONCAL\0";
+/// APONCAL 版本，固定 1。
+pub const PON_CAL_VERSION: u16 = 1;
+/// APONCAL 头长度，固定 0x80；payload 从 0x80 起。
+pub const PON_CAL_HEADER_SIZE: usize = 0x80;
+/// `format` 字段：1 = 原生 payload（原样搬运，不重排）。
+pub const PON_CAL_FORMAT_NATIVE: u32 = 1;
+/// APONCAL 容器总长，与 BDBOB 一致（2048 B）。
+pub const PON_CAL_SIZE: usize = 0x800;
+
+/// BDBOB 头里四个长度/CRC 字段的偏移。
+const BOB_DATA_SIZE_OFF: usize = 0x70;
+const BOB_DATA_CRC_OFF: usize = 0x74;
+const BOB_HEADER_SIZE_OFF: usize = 0x78;
+const BOB_HEADER_CRC_OFF: usize = 0x7c;
+
+/// 反射 CRC-32 的寄存器值（不补初值、不取反），与上游 `crc32_register` 同实现。
+pub fn crc32_register(data: &[u8], mut crc: u32) -> u32 {
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    crc
+}
+
+/// 原厂 BDBOB 表用的 CRC：初值 0、末尾取反（等同 u-boot `crc32(0, …)`）。
+pub fn fiberhome_crc32(data: &[u8]) -> u32 {
+    crc32_register(data, 0) ^ u32::MAX
+}
+
+/// APONCAL 容器用的 CRC：初值全 1、末尾取反（等同标准 zlib `crc32()`）。
+pub fn calibration_crc32(data: &[u8]) -> u32 {
+    crc32_register(data, u32::MAX) ^ u32::MAX
+}
+
+/// APONCAL 的 `chip` 枚举（u32）。只有这两个值，PonWrt 驱动按它选 apply 分支。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PonCalChip {
+    Gn28l95,
+    Ux3363,
+}
+
+impl PonCalChip {
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Gn28l95 => 1,
+            Self::Ux3363 => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gn28l95 => "GN28L95",
+            Self::Ux3363 => "UX3363",
+        }
+    }
+
+    /// BDBOB 头 0x30 的 chip id → APONCAL 枚举。上游把 0 与 0x28 都当 GN28L95。
+    fn from_bob_id(id: u8) -> Option<Self> {
+        match id {
+            0 | 0x28 => Some(Self::Gn28l95),
+            0x2e => Some(Self::Ux3363),
+            _ => None,
+        }
+    }
+}
+
+/// BDBOB 两处 CRC 用的是哪套种子。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BobCrcSeed {
+    /// 原厂口径（`fiberhome_crc32`）。上游只认这一套。
+    FiberHome,
+    /// 标准 zlib 口径。本机 `10ge_asym_table` / `xg_table` / `olt_table` 用这套。
+    Standard,
+}
+
+impl BobCrcSeed {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FiberHome => "原厂口径",
+            Self::Standard => "标准 zlib 口径",
+        }
+    }
+
+    fn crc(self, data: &[u8]) -> u32 {
+        match self {
+            Self::FiberHome => fiberhome_crc32(data),
+            Self::Standard => calibration_crc32(data),
+        }
+    }
+}
+
+/// 逐槽处理的结果状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PonCalStatus {
+    /// 完全按上游流程通过：长度、魔数、两处 CRC 都用原厂种子。
+    OkStrict,
+    /// 原厂种子不过，换标准 zlib 种子通过；payload 本身完好。
+    OkAltSeed(BobCrcSeed),
+    /// chip id 是 0x27（UX3326S1），APONCAL 没有对应枚举值。
+    ChipUnsupported,
+    /// 不是 BDBOB：长度不是 2048 或魔数不对。
+    NotBob,
+    /// 头里的长度字段自相矛盾。
+    BadFields,
+    /// 两套 CRC 种子都对不上。
+    CrcFail,
+}
+
+impl PonCalStatus {
+    /// 能否产出可交给 PonWrt 的 2048 B 文件。
+    pub fn exportable(self) -> bool {
+        matches!(self, Self::OkStrict | Self::OkAltSeed(_))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OkStrict => "PASS",
+            Self::OkAltSeed(_) => "PASS·换种子",
+            Self::ChipUnsupported => "chip 不在枚举",
+            Self::NotBob => "非 BDBOB",
+            Self::BadFields => "长度字段异常",
+            Self::CrcFail => "CRC 不匹配",
+        }
+    }
+}
+
+/// 一个 PON 槽跑完上游流程后的结果。
+pub struct PonCalRow {
+    pub table: String,
+    pub offset: usize,
+    /// BDBOB 头 0x30 的原始 chip id。
+    pub chip_id: u8,
+    /// 映射到的 APONCAL 枚举；`None` 表示不在枚举内。
+    pub chip: Option<PonCalChip>,
+    pub version: Option<String>,
+    pub status: PonCalStatus,
+    /// 转换出来的 2048 B（仅 `status.exportable()` 时非空）。
+    pub data: Option<Vec<u8>>,
+}
+
+/// 把一张 2048 B 的 BDBOB 校准表按上游流程封成 APONCAL。
+pub fn bob_to_aponcal(data: &[u8]) -> (PonCalStatus, Option<Vec<u8>>) {
+    if data.len() != PON_CAL_SIZE || !data.starts_with(AN_BOB_MAGIC) {
+        return (PonCalStatus::NotBob, None);
+    }
+    let (Some(dsize), Some(dcrc), Some(hsize), Some(hcrc)) = (
+        u32_at(data, BOB_DATA_SIZE_OFF),
+        u32_at(data, BOB_DATA_CRC_OFF),
+        u32_at(data, BOB_HEADER_SIZE_OFF),
+        u32_at(data, BOB_HEADER_CRC_OFF),
+    ) else {
+        return (PonCalStatus::BadFields, None);
+    };
+    let (dsize, hsize) = (dsize as usize, hsize as usize);
+    if hsize != PON_CAL_HEADER_SIZE || hsize + dsize != data.len() {
+        return (PonCalStatus::BadFields, None);
+    }
+
+    // 先按上游口径验，不过再按标准 zlib 验 —— 两套种子在本机都真实存在。
+    let mut seed = None;
+    for candidate in [BobCrcSeed::FiberHome, BobCrcSeed::Standard] {
+        let hdr_ok = candidate.crc(&data[..BOB_HEADER_CRC_OFF]) == hcrc;
+        let pay_ok = candidate.crc(&data[hsize..hsize + dsize]) == dcrc;
+        if hdr_ok && pay_ok {
+            seed = Some(candidate);
+            break;
+        }
+    }
+    let Some(seed) = seed else {
+        return (PonCalStatus::CrcFail, None);
+    };
+    let Some(chip) = PonCalChip::from_bob_id(data[0x30]) else {
+        return (PonCalStatus::ChipUnsupported, None);
+    };
+
+    let payload = &data[hsize..hsize + dsize];
+    let mut out = vec![0xff; PON_CAL_SIZE];
+    out[..PON_CAL_HEADER_SIZE].fill(0);
+    out[..PON_CAL_MAGIC.len()].copy_from_slice(PON_CAL_MAGIC);
+    out[0x08..0x0a].copy_from_slice(&PON_CAL_VERSION.to_le_bytes());
+    out[0x0a..0x0c].copy_from_slice(&(PON_CAL_HEADER_SIZE as u16).to_le_bytes());
+    out[0x0c..0x10].copy_from_slice(&chip.id().to_le_bytes());
+    out[0x10..0x14].copy_from_slice(&PON_CAL_FORMAT_NATIVE.to_le_bytes());
+    out[0x14..0x18].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    out[0x18..0x1c].copy_from_slice(&calibration_crc32(payload).to_le_bytes());
+    out[PON_CAL_HEADER_SIZE..PON_CAL_HEADER_SIZE + payload.len()].copy_from_slice(payload);
+    let new_hcrc = calibration_crc32(&out[..BOB_HEADER_CRC_OFF]);
+    out[BOB_HEADER_CRC_OFF..BOB_HEADER_CRC_OFF + 4].copy_from_slice(&new_hcrc.to_le_bytes());
+
+    let status = match seed {
+        BobCrcSeed::FiberHome => PonCalStatus::OkStrict,
+        other => PonCalStatus::OkAltSeed(other),
+    };
+    (status, Some(out))
+}
+
+/// 用户侧校验：按 PonWrt `bosa_load_calibration()` 的要求复核一遍成品。
+///
+/// 与上游只做「编码」不同，这里把驱动侧那道门也走一遍 —— 编码对了但驱动不收
+/// （版本、头长、format、chip 枚举、长度上限）在实机上是一样跑不起来的。
+pub fn verify_aponcal(data: &[u8]) -> Vec<(&'static str, bool)> {
+    let mut out = Vec::new();
+    out.push(("magic == APONCAL", data.starts_with(PON_CAL_MAGIC)));
+    let ver = u16_at(data, 0x08).unwrap_or(0);
+    let hs = u16_at(data, 0x0a).unwrap_or(0);
+    let chip = u32_at(data, 0x0c).unwrap_or(0);
+    let fmt = u32_at(data, 0x10).unwrap_or(0);
+    let plen = u32_at(data, 0x14).unwrap_or(0) as usize;
+    let pcrc = u32_at(data, 0x18).unwrap_or(0);
+    let hcrc = u32_at(data, BOB_HEADER_CRC_OFF).unwrap_or(0);
+    out.push(("version == 1", ver == PON_CAL_VERSION));
+    out.push(("hdrsize == 0x80", hs as usize == PON_CAL_HEADER_SIZE));
+    out.push(("format == 1", fmt == PON_CAL_FORMAT_NATIVE));
+    out.push(("chip ∈ {1,2}", chip == 1 || chip == 2));
+    out.push(("payload ≤ cell-0x80", plen <= data.len().saturating_sub(PON_CAL_HEADER_SIZE)));
+    out.push(("payload ≥ 0x780", plen >= 0x780));
+    out.push((
+        "header crc",
+        calibration_crc32(&data[..BOB_HEADER_CRC_OFF]) == hcrc,
+    ));
+    out.push((
+        "payload crc",
+        data.get(PON_CAL_HEADER_SIZE..PON_CAL_HEADER_SIZE + plen)
+            .map(|p| calibration_crc32(p) == pcrc)
+            .unwrap_or(false),
+    ));
+    out
+}
+
 /// 空字符串显示成 `—`，避免界面上出现「pon_mode=」这种半截话。
 fn or_dash(s: &str) -> &str {
     if s.is_empty() {
@@ -831,6 +1086,32 @@ impl An4475 {
                     same_as,
                     chip_id: bosa_chip_id(&f.data),
                     tag: bosa_tag(&f.data),
+                })
+            })
+            .collect()
+    }
+
+    /// PON 口 6 张 BDBOB 校准表逐张按上游 fiberhome-factory 的流程处理一遍。
+    ///
+    /// 上游只有一张表可处理，这里把同一套 validate → chip 映射 → 重封跑 6 次，
+    /// 每张都留下状态，便于在界面上直接看到「哪张能交给 PonWrt、哪张不能」。
+    pub fn pon_cal_rows(&self) -> Vec<PonCalRow> {
+        AN_CAL_TABLES
+            .iter()
+            .take(AN_BOB_TABLES)
+            .enumerate()
+            .filter_map(|(i, name)| {
+                let f = self.files.iter().find(|f| &f.name == name)?;
+                let (status, data) = bob_to_aponcal(&f.data);
+                let chip_id = f.data.get(0x30).copied().unwrap_or(0);
+                Some(PonCalRow {
+                    table: (*name).to_string(),
+                    offset: AN_CAL_FIXED_OFF + i * AN_CAL_SLOT,
+                    chip_id,
+                    chip: PonCalChip::from_bob_id(chip_id),
+                    version: bob_version(&f.data),
+                    status,
+                    data,
                 })
             })
             .collect()
@@ -1786,5 +2067,85 @@ mod tests {
         assert_eq!(p[1].tables, vec!["olt_table".to_string()]);
         assert!(p[1].driver.contains("UX3326S1"), "{}", p[1].driver);
         assert!(p[1].driver.contains("0x27"), "{}", p[1].driver);
+    }
+
+    /// 造一张结构合法、CRC 按指定种子填好的 BDBOB 表。
+    fn bob_fixture(chip_id: u8, seed: BobCrcSeed) -> Vec<u8> {
+        let mut t = vec![0u8; 2048];
+        t[..14].copy_from_slice(AN_BOB_MAGIC);
+        t[0x10..0x20].copy_from_slice(b"202404291559VB\0\0");
+        t[0x30] = chip_id;
+        for (i, b) in t[0x80..0x800].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        t[0x70..0x74].copy_from_slice(&1920u32.to_le_bytes());
+        t[0x78..0x7c].copy_from_slice(&0x80u32.to_le_bytes());
+        let dcrc = seed.crc(&t[0x80..0x800]);
+        t[0x74..0x78].copy_from_slice(&dcrc.to_le_bytes());
+        let hcrc = seed.crc(&t[..0x7c]);
+        t[0x7c..0x80].copy_from_slice(&hcrc.to_le_bytes());
+        t
+    }
+
+    #[test]
+    fn bob_to_aponcal_both_seeds() {
+        for seed in [BobCrcSeed::FiberHome, BobCrcSeed::Standard] {
+            let bob = bob_fixture(0x2E, seed);
+            let (st, out) = bob_to_aponcal(&bob);
+            let out = out.expect("应产出 APONCAL");
+            match (seed, st) {
+                (BobCrcSeed::FiberHome, PonCalStatus::OkStrict) => {}
+                (BobCrcSeed::Standard, PonCalStatus::OkAltSeed(BobCrcSeed::Standard)) => {}
+                _ => panic!("状态不对: {st:?} / {seed:?}"),
+            }
+            assert_eq!(out.len(), PON_CAL_SIZE);
+            assert_eq!(&out[..8], PON_CAL_MAGIC);
+            assert_eq!(u32_at(&out, 0x0c), Some(2), "chip 应为 UX3363");
+            assert_eq!(u32_at(&out, 0x14), Some(1920));
+            // payload 必须原样搬运，一个字节都不许动
+            assert_eq!(&out[0x80..0x800], &bob[0x80..0x800]);
+            let checks = verify_aponcal(&out);
+            assert!(checks.iter().all(|(_, ok)| *ok), "{checks:?}");
+        }
+    }
+
+    #[test]
+    fn bob_to_aponcal_rejects_downlink_chip() {
+        // 下行 olt_table 的 0x27（UX3326S1）不在 APONCAL 枚举里，不能硬填 2。
+        let bob = bob_fixture(0x27, BobCrcSeed::Standard);
+        let (st, out) = bob_to_aponcal(&bob);
+        assert_eq!(st, PonCalStatus::ChipUnsupported);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn bob_to_aponcal_rejects_corrupt() {
+        let mut bob = bob_fixture(0x2E, BobCrcSeed::FiberHome);
+        bob[0x300] ^= 0xff;
+        assert_eq!(bob_to_aponcal(&bob).0, PonCalStatus::CrcFail);
+        assert_eq!(bob_to_aponcal(&[0u8; 16]).0, PonCalStatus::NotBob);
+    }
+
+    #[test]
+    fn pon_cal_rows_covers_all_pob_slots() {
+        let mut a = An4475::new();
+        a.files = vec![
+            AnFile { name: "10ge_asym_table".into(), data: bob_fixture(0x2E, BobCrcSeed::Standard) },
+            AnFile { name: "10ge_sym_table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "xg_table".into(), data: bob_fixture(0x2E, BobCrcSeed::Standard) },
+            AnFile { name: "xgs_table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "olt_table".into(), data: bob_fixture(0x27, BobCrcSeed::Standard) },
+        ];
+        let rows = a.pon_cal_rows();
+        assert_eq!(rows.len(), AN_BOB_TABLES);
+        assert_eq!(rows[0].offset, AN_CAL_FIXED_OFF);
+        assert_eq!(rows[5].offset, AN_CAL_FIXED_OFF + 5 * AN_CAL_SLOT);
+        assert_eq!(rows[5].status, PonCalStatus::ChipUnsupported);
+        assert!(!rows[5].status.exportable());
+        // 5 张上行全部可导出，且种子分别命中两套
+        assert!(rows[..5].iter().all(|r| r.status.exportable()));
+        assert_eq!(rows[1].status, PonCalStatus::OkStrict);
+        assert_eq!(rows[0].status, PonCalStatus::OkAltSeed(BobCrcSeed::Standard));
     }
 }

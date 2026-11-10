@@ -765,6 +765,165 @@ def an4475_pon_ports(files):
     ]
 
 
+# ===== PON 校准表 → APONCAL（与上游 fiberhome-factory 同流程）=====
+# 上游只处理一张表：validate_bdbob() → 按头 0x30 映射 chip → encode_pon_calibration()
+# 重封成 2048 B。AN4475 有 6 个 PON 槽，这里把同一套流程逐槽跑一遍，并把上游
+# 隐含假设、本机却不成立的两件事显式化：
+#   ① CRC 有两套种子 —— 原厂 u-boot 口径（初值 0）与标准 zlib 口径（初值全 1）。
+#      10ge_asym_table / xg_table / olt_table 属于后者，硬套原厂口径会误判为坏表。
+#   ② chip 0x27（UX3326S1）不在 APONCAL 枚举内（只有 1=GN28L95、2=UX3363），
+#      下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支。
+AN_BOB_TABLES = 6
+
+PON_CAL_MAGIC = b"APONCAL\x00"
+PON_CAL_VERSION = 1
+PON_CAL_HEADER_SIZE = 0x80
+PON_CAL_FORMAT_NATIVE = 1
+PON_CAL_SIZE = 0x800
+
+AN_BOB_DATA_SIZE_OFF = 0x70
+AN_BOB_DATA_CRC_OFF = 0x74
+AN_BOB_HEADER_SIZE_OFF = 0x78
+AN_BOB_HEADER_CRC_OFF = 0x7C
+
+PON_CAL_CHIPS = {1: "GN28L95", 2: "UX3363"}
+_BOB_CHIP_TO_APONCAL = {0x00: 1, 0x28: 1, 0x2E: 2}
+
+
+def an4475_crc32_register(data, crc):
+    """反射 CRC-32 的寄存器值：不补初值、不取反（与上游 crc32_register 同实现）。"""
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
+    return crc & 0xFFFFFFFF
+
+
+def an4475_fiberhome_crc32(data):
+    """原厂 BDBOB 口径：初值 0、末尾取反（等同 u-boot crc32(0, …)）。"""
+    return an4475_crc32_register(data, 0) ^ 0xFFFFFFFF
+
+
+def an4475_calibration_crc32(data):
+    """APONCAL 口径：初值全 1、末尾取反（等同标准 zlib crc32()）。"""
+    return an4475_crc32_register(data, 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+
+def an4475_bob_to_aponcal(data):
+    """按上游流程把一张 2048 B BDBOB 封成 APONCAL。
+
+    返回 (status, seed, out)：status 为中文短语，seed 为命中的 CRC 口径名，
+    不能导出时 out 为 None。
+    """
+    if len(data) != PON_CAL_SIZE or not data.startswith(AN_BOB_MAGIC):
+        return "非 BDBOB", None, None
+
+    dsize = int.from_bytes(data[AN_BOB_DATA_SIZE_OFF:AN_BOB_DATA_SIZE_OFF + 4], "little")
+    dcrc = int.from_bytes(data[AN_BOB_DATA_CRC_OFF:AN_BOB_DATA_CRC_OFF + 4], "little")
+    hsize = int.from_bytes(data[AN_BOB_HEADER_SIZE_OFF:AN_BOB_HEADER_SIZE_OFF + 4], "little")
+    hcrc = int.from_bytes(data[AN_BOB_HEADER_CRC_OFF:AN_BOB_HEADER_CRC_OFF + 4], "little")
+    if hsize != PON_CAL_HEADER_SIZE or hsize + dsize != len(data):
+        return "长度字段异常", None, None
+
+    seed = None
+    for name, fn in (("原厂口径", an4475_fiberhome_crc32),
+                     ("标准 zlib 口径", an4475_calibration_crc32)):
+        if (fn(data[:AN_BOB_HEADER_CRC_OFF]) == hcrc
+                and fn(data[hsize:hsize + dsize]) == dcrc):
+            seed = name
+            break
+    if seed is None:
+        return "CRC 不匹配", None, None
+
+    chip = _BOB_CHIP_TO_APONCAL.get(data[0x30])
+    if chip is None:
+        return "chip 不在枚举", seed, None
+
+    payload = data[hsize:hsize + dsize]
+    out = bytearray(b"\xff" * PON_CAL_SIZE)
+    out[:PON_CAL_HEADER_SIZE] = b"\x00" * PON_CAL_HEADER_SIZE
+    out[:8] = PON_CAL_MAGIC
+    out[0x08:0x0A] = PON_CAL_VERSION.to_bytes(2, "little")
+    out[0x0A:0x0C] = PON_CAL_HEADER_SIZE.to_bytes(2, "little")
+    out[0x0C:0x10] = chip.to_bytes(4, "little")
+    out[0x10:0x14] = PON_CAL_FORMAT_NATIVE.to_bytes(4, "little")
+    out[0x14:0x18] = len(payload).to_bytes(4, "little")
+    out[0x18:0x1C] = an4475_calibration_crc32(payload).to_bytes(4, "little")
+    out[PON_CAL_HEADER_SIZE:PON_CAL_HEADER_SIZE + len(payload)] = payload
+    out[AN_BOB_HEADER_CRC_OFF:AN_BOB_HEADER_CRC_OFF + 4] = \
+        an4475_calibration_crc32(bytes(out[:AN_BOB_HEADER_CRC_OFF])).to_bytes(4, "little")
+
+    status = "PASS" if seed == "原厂口径" else "PASS·换种子"
+    return status, seed, bytes(out)
+
+
+def an4475_pon_cal_rows(files):
+    """PON 口 6 张 BDBOB 表逐张跑一遍上游流程，返回结果列表。"""
+    rows = []
+    for i, name in enumerate(AN_CAL_TABLES[:AN_BOB_TABLES]):
+        blob = files.get(name)
+        if blob is None:
+            continue
+        status, seed, out = an4475_bob_to_aponcal(blob)
+        rows.append({
+            "table": name,
+            "offset": AN_CAL_FIXED_OFF + i * AN_CAL_SLOT,
+            "chip_id": blob[0x30] if len(blob) > 0x30 else 0xFF,
+            "version": an4475_bob_version(blob),
+            "status": status,
+            "seed": seed,
+            "data": out,
+        })
+    return rows
+
+
+def an4475_write_pon_cal(files, out_dir, has_slots=True, header=""):
+    """逐张写 pon-cal-<表名>.bin + pon-cal-report.txt，返回 (报告, 成功张数)。"""
+    rows = an4475_pon_cal_rows(files)
+    if not rows:
+        raise SystemExit("没有 PON 校准表（检查是否只载入了配置文件）")
+    os.makedirs(out_dir, exist_ok=True)
+
+    lines = [header] if header else []
+    lines.append("流程: 与 fiberhome-factory 一致"
+                 "（validate_bdbob → chip 映射 → encode_pon_calibration）")
+    lines.append("")
+    lines.append("%-18s %9s %4s %16s %10s  %s"
+                 % ("表名", "偏移", "chip", "版本戳", "状态", "输出"))
+
+    ok = 0
+    for r in rows:
+        written = "—"
+        if r["data"] is not None:
+            path = os.path.join(out_dir, "pon-cal-%s.bin" % r["table"])
+            with open(path, "wb") as f:
+                f.write(r["data"])
+            ok += 1
+            written = "%s (%d B)" % (os.path.basename(path), len(r["data"]))
+        off = "0x%06X" % r["offset"] if has_slots else "—"
+        tail = ""
+        if r["seed"]:
+            tail = "  [%s]" % r["seed"]
+        lines.append("%-18s %9s 0x%02X %16s %10s  %s%s"
+                     % (r["table"], off, r["chip_id"], r["version"] or "—",
+                        r["status"], written, tail))
+
+    lines.append("")
+    lines.append("可交给 PonWrt: %d/%d 张" % (ok, len(rows)))
+    lines.append("")
+    lines.append("说明:")
+    lines.append("· PASS 表示长度/魔数/两处 CRC 全部通过，输出可直接放 0x0000；")
+    lines.append("· PASS·换种子 表示原厂口径 CRC 不过、标准 zlib 口径通过 —— 表本身完好，")
+    lines.append("  只是产出工具链不同，payload 与严格通过的那几张同源；")
+    lines.append("· chip 0x27（UX3326S1）不在 APONCAL 枚举内（只有 1=GN28L95、2=UX3363），")
+    lines.append("  下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支。")
+
+    report = "\n".join(lines) + "\n"
+    with open(os.path.join(out_dir, "pon-cal-report.txt"), "w", encoding="utf-8") as f:
+        f.write(report)
+    return report, ok
+
+
 def cal_offset(name):
     """校准表名 -> 直读区偏移；不在槽表里返回 None（走压缩区）。"""
     if name in AN_CAL_TABLES:
@@ -1416,6 +1575,9 @@ def main():
                    help="--export-mt76 改成原样截取（前 7 680 B，保真但功率区不可用）")
     a.add_argument("--mt76-template", metavar="BIN",
                    help="--export-mt76 打底用的模板（默认 assets/mt7990_eeprom_2i5i.bin）")
+    a.add_argument("--export-pon-cal", metavar="DIR",
+                   help="按 fiberhome-factory 流程把 PON 口每张 BDBOB 校准表各转一次，"
+                        "逐张写出 APONCAL + pon-cal-report.txt 到 DIR")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -1592,6 +1754,23 @@ def main():
                           % (name, len(blob), cal_offset(name),
                              an4475_bob_version(blob) or "-",
                              ("  chip 0x%02X" % cid) if cid else ""))
+            rows = an4475_pon_cal_rows(files)
+            if rows:
+                print("  PON 校准 → APONCAL（按 fiberhome-factory 流程逐张处理）")
+                for r in rows:
+                    print("    %-20s %-14s%s"
+                          % (r["table"], r["status"],
+                             ("  [%s]" % r["seed"]) if r["seed"] else ""))
+                print("    可交付 PonWrt: %d/%d 张"
+                      % (sum(1 for r in rows if r["data"] is not None), len(rows)))
+                if args.export_pon_cal:
+                    rep, n = an4475_write_pon_cal(
+                        files, args.export_pon_cal,
+                        has_slots=is_an4475_compact(data),
+                        header="输入: %s" % args.bin)
+                    print(rep)
+                    print("报告 -> %s"
+                          % os.path.join(args.export_pon_cal, "pon-cal-report.txt"))
             print("  出厂文件  : %d 个，共 %d 字节"
                   % (len(files), sum(len(v) for v in files.values())))
             for name in sorted(files):

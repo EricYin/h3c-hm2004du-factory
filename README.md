@@ -351,6 +351,72 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 
 BOB 表头固定：`fiberhomebdbob`（14 B）+ 16 B 版本戳 + `0x30` chip id + `0x70` payload 长度 + `0x74` CRC32，载荷从 `0x80` 起 1920 B。上行表的型号明文在 `0x95`（`ux3363`），下行在 `0x1C4`（`UX3326S1`），工具扫 `0x80–0x1FF` 的 ASCII 串，两条都能取到。
 
+### PON 校准 → APONCAL：按上游 fiberhome-factory 的流程逐张处理
+
+上游 `fiberhome-factory` 只处理**一张**表：读 `fhdata/table` → `validate_bdbob()` 校验长度 / 魔数 / 两处 CRC → 按头 `0x30` 的 chip id 映射成 `GN28L95` 或 `UX3363` → `encode_pon_calibration()` 重封成 2048 B 的 `APONCAL` 容器，落在固定 `0x0000`。
+
+AN4475 有 6 个 PON 槽，本工具把同一套流程**逐槽跑一遍**，每张都留结果：
+
+```bash
+# Rust（GUI 同一份代码，另有无界面入口）
+./an758x-factory --export-pon-cal factory-an4475-2mib.bin out/
+
+# Python 伴生工具
+python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin --export-pon-cal out/
+```
+
+GUI 里在「PON / 光组件」块的表末多一列状态，块底有「全部导出 APONCAL…」按钮，选目录即写 6 个文件 + 报告。
+
+真机（`factory-an4475-2mib.bin`）实测结果：
+
+| 槽 | 表名 | chip | 状态 | 命中种子 | 输出 |
+|---|---|---|---|---:|---|
+| `0x1A0000` | `10ge_asym_table` | `0x2E` | PASS·换种子 | 标准 zlib | `5441ba07…` |
+| `0x1A1000` | `10ge_sym_table` | `0x2E` | PASS | 原厂 | `82ade014…` |
+| `0x1A2000` | `xg_table` | `0x2E` | PASS·换种子 | 标准 zlib | `d736edeb…` |
+| `0x1A3000` | `xgs_table` | `0x2E` | PASS | 原厂 | `82ade014…` |
+| `0x1A4000` | `table` | `0x2E` | PASS | 原厂 | `82ade014…` |
+| `0x1A5000` | `olt_table` | `0x27` | chip 不在枚举 | 标准 zlib | 不产出 |
+
+（md5 是导出后的 2048 B 整文件。`10ge_sym` / `xgs` / `table` 三张 payload 逐字节相同，所以成品也逐字节相同。）
+
+**可交付 PonWrt：5/6 张。**
+
+#### 两处与上游不同的地方
+
+上游只看一张表，这两件事它碰不到；AN4475 会碰到，所以必须显式处理。
+
+**① CRC 有两套种子，不能只用一套。**
+
+| 种子 | 实现 | 用它的表 |
+|---|---|---|
+| 原厂（u-boot 口径） | `crc32_register(d, 0) ^ 0xFFFFFFFF` | `10ge_sym` / `xgs` / `table` |
+| 标准 zlib 口径 | `crc32_register(d, 0xFFFFFFFF) ^ 0xFFFFFFFF` | `10ge_asym` / `xg` / `olt_table`（含 `mtd9` 的 `table`） |
+
+上游 `fiberhome_crc32()` 只实现了第一种。直接套用会把 `10ge_asym` / `xg` / `olt_table` 判成「header CRC mismatch」，看着像三张坏表，其实完好。工具先按原厂种子验，不过再按标准种子验，报告里标出实际命中的那套；只要有一套对上就照常导出，**payload 一个字节不动**。
+
+**② chip id `0x27`（UX3326S1）不在 APONCAL 枚举里。**
+
+枚举只有 `1 = GN28L95`、`2 = UX3363`，PonWrt 的 `bosa_load_calibration()` 也只接受这两个值。下行 `olt_table` 的 chip 是 `0x27`，所以判 `chip 不在枚举`、**不产出文件** —— 硬填 `2` 会让驱动走 UX3363 的 apply 分支，calibration 静默不生效，比不加载更难查。
+
+#### 成品结构
+
+```
+0000  APONCAL\0           magic（8 B）
+0008  01 00               version = 1
+000a  80 00               hdrsize = 0x80
+000c  02 00 00 00         chip = 2（UX3363）
+0010  01 00 00 00         format = 1（原生 payload，不重排）
+0014  80 07 00 00         payload 长度 = 1920
+0018  xx xx xx xx         payload CRC（标准 zlib）
+007c  xx xx xx xx         头 CRC（标准 zlib，覆盖 0x00–0x7B）
+0080  ...                 BDBOB 的 1920 B payload，原样搬运
+```
+
+总长固定 2048 B，`0x800` 之后全 `0xFF`。两个 CRC 都按标准 zlib 算 —— 直接抄原表 `0x74` 那个值会判 CRC 失败、整段丢弃。
+
+导出时还会按 PonWrt `bosa_load_calibration()` 的规则再复核一遍（magic / version / hdrsize / format / chip ∈ {1,2} / `plen ≤ cell-0x80` / `plen ≥ 0x780` / 两个 CRC），任何一项不过都会写进报告。
+
 ### 身份字段与 MAC 规律
 
 `factory_conf` 里 12 个 MAC 全部明文，实测关系如下（真机 `D4:9F:29:04:E7:50` 一组）：

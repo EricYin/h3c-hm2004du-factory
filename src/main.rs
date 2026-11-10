@@ -920,6 +920,9 @@ impl Editor {
             .show(ui, |ui| {
                 let tables = self.an.cal_tables();
                 let ports = self.an.pon_ports();
+                // 上游只会处理一张表；这里把 6 张 BDBOB 表逐张跑同一套流程，
+                // 状态直接标在表后面，一眼看出哪张能交给 PonWrt、哪张不能。
+                let pon_rows = self.an.pon_cal_rows();
 
                 egui::Grid::new("an_pon_mode")
                     .num_columns(2)
@@ -990,7 +993,7 @@ impl Editor {
 
                 ui.add_space(6.0);
                 egui::Grid::new("an_pon_tables")
-                    .num_columns(4)
+                    .num_columns(5)
                     .spacing([14.0, 2.0])
                     .show(ui, |ui| {
                         for t in &tables {
@@ -1005,9 +1008,54 @@ impl Editor {
                                 note.push_str(&format!(" · 同 {same}"));
                             }
                             ui.weak(note);
+                            // APONCAL 转换状态：只有 6 张 BDBOB 表有，其余 5 张显示 —
+                            match pon_rows.iter().find(|r| r.table == t.name) {
+                                Some(r) => {
+                                    let color = match r.status {
+                                        an4475::PonCalStatus::OkStrict => {
+                                            egui::Color32::from_rgb(0x2F, 0x8B, 0x4F)
+                                        }
+                                        an4475::PonCalStatus::OkAltSeed(_) => {
+                                            egui::Color32::from_rgb(0xB0, 0x7A, 0x1E)
+                                        }
+                                        _ => egui::Color32::from_rgb(0xB3, 0x26, 0x1E),
+                                    };
+                                    ui.colored_label(color, r.status.label());
+                                }
+                                None => {
+                                    ui.weak("—");
+                                }
+                            }
                             ui.end_row();
                         }
                     });
+
+                ui.add_space(6.0);
+                let ok = pon_rows.iter().filter(|r| r.status.exportable()).count();
+                let mut export_to: Option<(std::path::PathBuf, Result<usize, String>)> = None;
+                ui.horizontal(|ui| {
+                    ui.weak(format!(
+                        "按 fiberhome-factory 流程逐张转换：{ok}/{} 张可交付 PonWrt",
+                        pon_rows.len()
+                    ));
+                    if ui.button("全部导出 APONCAL…").clicked() {
+                        if let Some(dir) = FileDialog::new()
+                            .set_title("选择 APONCAL 输出目录")
+                            .pick_folder()
+                        {
+                            match write_pon_cal_dir(&self.an, &dir, true, "来源: 当前编辑中的镜像") {
+                                Ok((_, n)) => export_to = Some((dir, Ok(n))),
+                                Err(e) => export_to = Some((dir, Err(e))),
+                            }
+                        }
+                    }
+                });
+                if let Some((dir, res)) = export_to {
+                    self.msg = match res {
+                        Ok(n) => format!("已导出 {n} 张 APONCAL + 报告 -> {}", dir.display()),
+                        Err(e) => format!("导出失败: {e}"),
+                    };
+                }
 
                 ui.add_space(4.0);
                 ui.weak("两行「chip id」是校准表头 0x30 那一字节：0x2E = 上行 BOSA 驱动（UX3363/UX3361 同族），0x27 = 下行 UX3326S1。");
@@ -1406,13 +1454,134 @@ fn export_an_cli(input: &str, output: &str) {
     }
 }
 
+/// 无界面批处理：`an758x-factory --export-pon-cal <输入> <输出目录>`。
+///
+/// 按上游 fiberhome-factory 的流程（validate_bdbob → chip 映射 → encode）把 PON 口
+/// **每张** BDBOB 校准表各处理一次，逐张写出 2048 B 的 APONCAL 文件，并留一份
+/// `pon-cal-report.txt` 记录每张的状态、命中的 CRC 种子和驱动侧复核结果。
+fn export_pon_cal_cli(input: &str, out_dir: &str) {
+    let bytes = match std::fs::read(input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取失败 {input}: {e}");
+            return;
+        }
+    };
+    let parsed = if an4475::is_compact(&bytes) {
+        an4475::parse_compact(&bytes)
+    } else {
+        an4475::parse_mtd9(&bytes)
+    };
+    let Some(a) = parsed else {
+        eprintln!("无法识别输入（既不是 mtd9 备份，也不是 AN4-* 容器）: {input}");
+        return;
+    };
+    let dir = Path::new(out_dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("建目录失败 {out_dir}: {e}");
+        return;
+    }
+
+    // 偏移只有容器（2 MiB / 1 MiB 镜像）才有意义：mtd9 备份是 UBI 卷，没有直读区。
+    let has_slots = an4475::is_compact(&bytes);
+    match write_pon_cal_dir(&a, Path::new(out_dir), has_slots, &format!("输入: {input}")) {
+        Ok((report, _ok)) => {
+            print!("{report}");
+            println!("报告 -> {}", Path::new(out_dir).join("pon-cal-report.txt").display());
+        }
+        Err(e) => eprintln!("{e}"),
+    }
+}
+
+/// 把 PON 口每张 BDBOB 表按上游流程各转一次、逐张写进目录，返回（报告正文, 成功张数）。
+///
+/// CLI 与界面按钮共用：界面里数据已在内存，不必再从磁盘读一遍。
+fn write_pon_cal_dir(
+    a: &An4475,
+    dir: &Path,
+    has_slots: bool,
+    header: &str,
+) -> Result<(String, usize), String> {
+    let rows = a.pon_cal_rows();
+    if rows.is_empty() {
+        return Err("没有 PON 校准表（检查是否只载入了配置文件）".to_string());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败 {}: {e}", dir.display()))?;
+
+    let mut report = String::new();
+    report.push_str(header);
+    report.push_str("\n流程: 与 fiberhome-factory 一致（validate_bdbob → chip 映射 → encode_pon_calibration）\n\n");
+    report.push_str(&format!(
+        "{:<18} {:>9} {:>4} {:>16} {:>10}  {}\n",
+        "表名", "偏移", "chip", "版本戳", "状态", "输出"
+    ));
+
+    let mut ok = 0usize;
+    for r in &rows {
+        let mut written = String::from("—");
+        if let Some(data) = &r.data {
+            let path = dir.join(format!("pon-cal-{}.bin", r.table));
+            match std::fs::write(&path, data) {
+                Ok(_) => {
+                    ok += 1;
+                    written = format!(
+                        "{} ({} B)",
+                        path.file_name().unwrap().to_string_lossy(),
+                        data.len()
+                    );
+                    // 顺手按 PonWrt 驱动侧规则复核：编码对了但驱动不收，一样跑不起来。
+                    let checks = an4475::verify_aponcal(data);
+                    let bad: Vec<&str> =
+                        checks.iter().filter(|(_, v)| !v).map(|(n, _)| *n).collect();
+                    if !bad.is_empty() {
+                        written.push_str(&format!("  [驱动侧复核未过: {}]", bad.join(", ")));
+                    }
+                }
+                Err(e) => written = format!("写入失败: {e}"),
+            }
+        }
+        let seed = match r.status {
+            an4475::PonCalStatus::OkAltSeed(s) => format!("  [{}]", s.name()),
+            an4475::PonCalStatus::OkStrict => "  [原厂口径]".to_string(),
+            _ => String::new(),
+        };
+        let off = if has_slots {
+            format!("0x{:06X}", r.offset)
+        } else {
+            "—".to_string()
+        };
+        report.push_str(&format!(
+            "{:<18} {:>9} 0x{:02X} {:>16} {:>10}  {}{}\n",
+            r.table,
+            off,
+            r.chip_id,
+            r.version.clone().unwrap_or_else(|| "—".into()),
+            r.status.label(),
+            written,
+            seed
+        ));
+    }
+
+    report.push_str(&format!("\n可交给 PonWrt: {ok}/{} 张\n", rows.len()));
+    report.push_str(
+        "\n说明:\n\
+         · PASS 表示长度/魔数/两处 CRC 全部通过，输出可直接放 0x0000；\n\
+         · PASS·换种子 表示原厂口径 CRC 不过、标准 zlib 口径通过 —— 表本身完好，\n\
+         只是产出工具链不同，payload 与严格通过的那几张同源；\n\
+         · chip 0x27（UX3326S1）不在 APONCAL 枚举内（只有 1=GN28L95、2=UX3363），\n\
+         下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支。\n",
+    );
+    let rp = dir.join("pon-cal-report.txt");
+    std::fs::write(&rp, &report).map_err(|e| format!("写报告失败 {}: {e}", rp.display()))?;
+    Ok((report, ok))
+}
+
 /// 无界面批处理：`an758x-factory --export-mt76 <输入> <输出> [carve]`。
 ///
 /// 输入可以是 mtd9 备份 / 1–2 MiB 容器，也可以直接是那份 1 353 728 B 的
 /// `MT7993_EEPROM.bin`（按首两字节 0x7993 认）。输出恒为 7 680 B。
 /// 默认「模板打底」，末尾加 `carve` 改成「原样截取」。
-fn export_mt76_cli(input: &str, output: &str, carve: bool) {
-    let bytes = match std::fs::read(input) {
+fn export_mt76_cli(input: &str, output: &str, carve: bool) {    let bytes = match std::fs::read(input) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("读取失败 {input}: {e}");
@@ -1495,6 +1664,10 @@ fn main() -> eframe::Result {
         export_mt76_cli(&argv[2], &argv[3], argv.len() > 4 && argv[4] == "carve");
         return Ok(());
     }
+    if argv.len() == 4 && argv[1] == "--export-pon-cal" {
+        export_pon_cal_cli(&argv[2], &argv[3]);
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // 800 px 起：顶栏按钮一行放得下（680 时会挤成两行，虽不丢按钮但很挤）。
@@ -1503,7 +1676,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.8.3",
+        "AN758X Factory 编辑器 v0.8.4",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
