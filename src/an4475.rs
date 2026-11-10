@@ -183,6 +183,78 @@ pub const AN_CAL_TABLES: [&str; 11] = [
 /// 顺序：5 张上行（10ge_asym / 10ge_sym / xg / xgs / table）+ 1 张下行（olt_table）。
 pub const AN_BOB_TABLES: usize = 6;
 
+/// 上行 5 张 BDBOB 表 = `AN_CAL_TABLES` 的前 5 个。
+///
+/// `CompactOptions::pon_aponcal` 只动这 5 张。第 6 张 `olt_table` 是下行、
+/// chip id 0x27（UX3326S1），APONCAL 枚举里没有对应值 —— 硬转只会让 PonWrt
+/// 走错 apply 分支，所以无论开关怎么设，槽里都保持原厂 BDBOB 原样。
+pub const AN_UPLINK_BOB: [&str; 5] = [
+    "10ge_asym_table",
+    "10ge_sym_table",
+    "xg_table",
+    "xgs_table",
+    "table",
+];
+
+/// 这张表是不是「打包时要转 APONCAL」的上行表。
+pub fn is_uplink_bob(name: &str) -> bool {
+    AN_UPLINK_BOB.contains(&name)
+}
+
+/// 打包 2 MiB 容器时的 PON 区策略。默认 = 出厂原样。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompactOptions {
+    /// 上行 5 张 BDBOB 表写槽前先按 fiberhome-factory 流程转成 APONCAL。
+    ///
+    /// 打开后产出的镜像 PON 区是 PonWrt 直接能读的格式；原厂 `mt_wifi`
+    /// 只认 BDBOB，所以这种镜像**不适合回刷原厂固件**。
+    pub pon_aponcal: bool,
+}
+
+/// 单张上行表打包时的处理结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PonInlineAction {
+    /// 按 fiberhome 流程转成 APONCAL 后写入槽。
+    Converted(PonCalStatus),
+    /// 槽里本来就是 APONCAL，原样保留（重复打包时）。
+    AlreadyApconal,
+    /// 流程没走通，保留原表 —— 半张 APONCAL 比原表更危险。
+    Kept(PonCalStatus),
+}
+
+impl PonInlineAction {
+    pub fn ok(self) -> bool {
+        matches!(self, Self::Converted(_) | Self::AlreadyApconal)
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Converted(st) => format!("APONCAL · {}", st.label()),
+            Self::AlreadyApconal => "已是 APONCAL".to_string(),
+            Self::Kept(st) => format!("保留原表 · {}", st.label()),
+        }
+    }
+}
+
+/// 一张上行表的打包明细。
+pub struct PonInline {
+    pub table: String,
+    pub offset: usize,
+    pub action: PonInlineAction,
+}
+
+/// 单张表的内联处理：能转就转，转不了原样退回。
+fn inline_aponcal(raw: &[u8]) -> (Vec<u8>, PonInlineAction) {
+    if raw.starts_with(PON_CAL_MAGIC) {
+        return (raw.to_vec(), PonInlineAction::AlreadyApconal);
+    }
+    let (status, out) = bob_to_aponcal(raw);
+    match out {
+        Some(d) if status.exportable() => (d, PonInlineAction::Converted(status)),
+        _ => (raw.to_vec(), PonInlineAction::Kept(status)),
+    }
+}
+
 /// 校准表名 → 直读区偏移；不是固定槽里的表就返回 `None`（走压缩区）。
 pub fn cal_offset(name: &str) -> Option<usize> {    AN_CAL_TABLES
         .iter()
@@ -723,12 +795,17 @@ pub enum PonCalStatus {
     BadFields,
     /// 两套 CRC 种子都对不上。
     CrcFail,
+    /// 槽里已经是 APONCAL —— 镜像由 `--pon-aponcal` 打包，无需再转。
+    AlreadyApconal,
 }
 
 impl PonCalStatus {
     /// 能否产出可交给 PonWrt 的 2048 B 文件。
     pub fn exportable(self) -> bool {
-        matches!(self, Self::OkStrict | Self::OkAltSeed(_))
+        matches!(
+            self,
+            Self::OkStrict | Self::OkAltSeed(_) | Self::AlreadyApconal
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -739,6 +816,7 @@ impl PonCalStatus {
             Self::NotBob => "非 BDBOB",
             Self::BadFields => "长度字段异常",
             Self::CrcFail => "CRC 不匹配",
+            Self::AlreadyApconal => "已是 APONCAL",
         }
     }
 }
@@ -846,6 +924,22 @@ pub fn verify_aponcal(data: &[u8]) -> Vec<(&'static str, bool)> {
     out
 }
 
+/// APONCAL 头 0x0C 的 chip 枚举（u32）→ 对应的 BOSA 驱动类型。
+///
+/// 只有 1 = GN28L95、2 = UX3363；读回内联镜像时用它在界面上还原芯片型号。
+pub fn aponcal_chip(data: &[u8]) -> Option<PonCalChip> {
+    match u32_at(data, 0x0c)? {
+        1 => Some(PonCalChip::Gn28l95),
+        2 => Some(PonCalChip::Ux3363),
+        _ => None,
+    }
+}
+
+/// APONCAL 头 0x08 的版本号（u16，固定 1）。
+pub fn aponcal_version(data: &[u8]) -> Option<u16> {
+    u16_at(data, 0x08)
+}
+
 /// 空字符串显示成 `—`，避免界面上出现「pon_mode=」这种半截话。
 fn or_dash(s: &str) -> &str {
     if s.is_empty() {
@@ -870,6 +964,8 @@ pub struct CalTableInfo {
     pub chip_id: Option<u8>,
     /// 表载荷里的型号明文（`ux3363` / `UX3326S1`）。
     pub tag: Option<String>,
+    /// 槽里已经是 APONCAL（而不是出厂 BDBOB）—— 由 `--pon-aponcal` 打包的镜像。
+    pub aponcal: bool,
 }
 
 /// 一个 PON 方向的软件可见信息。
@@ -1009,6 +1105,7 @@ impl An4475 {
                     same_as: t.same_as.clone(),
                     chip_id: t.chip_id,
                     tag: t.tag.clone(),
+                    aponcal: t.aponcal,
                 })
                 .collect()
         };
@@ -1086,6 +1183,7 @@ impl An4475 {
                     same_as,
                     chip_id: bosa_chip_id(&f.data),
                     tag: bosa_tag(&f.data),
+                    aponcal: f.data.starts_with(PON_CAL_MAGIC),
                 })
             })
             .collect()
@@ -1102,14 +1200,32 @@ impl An4475 {
             .enumerate()
             .filter_map(|(i, name)| {
                 let f = self.files.iter().find(|f| &f.name == name)?;
-                let (status, data) = bob_to_aponcal(&f.data);
-                let chip_id = f.data.get(0x30).copied().unwrap_or(0);
+                // 已经由本工具内联过 APONCAL 的镜像：槽里就是成品，不再跑一遍流程。
+                // 这时 chip / 版本要换成从 APONCAL 头读，否则显示成 0x00 / —。
+                let (status, data, chip_id, version) = if f.data.starts_with(PON_CAL_MAGIC) {
+                    let chip = aponcal_chip(&f.data);
+                    let cid = match chip {
+                        Some(PonCalChip::Ux3363) => 0x2e,
+                        Some(PonCalChip::Gn28l95) => 0x28,
+                        None => 0,
+                    };
+                    (
+                        PonCalStatus::AlreadyApconal,
+                        Some(f.data.clone()),
+                        cid,
+                        aponcal_version(&f.data).map(|v| format!("v{v}")),
+                    )
+                } else {
+                    let (st, data) = bob_to_aponcal(&f.data);
+                    let cid = f.data.get(0x30).copied().unwrap_or(0);
+                    (st, data, cid, bob_version(&f.data))
+                };
                 Some(PonCalRow {
                     table: (*name).to_string(),
                     offset: AN_CAL_FIXED_OFF + i * AN_CAL_SLOT,
                     chip_id,
                     chip: PonCalChip::from_bob_id(chip_id),
-                    version: bob_version(&f.data),
+                    version,
                     status,
                     data,
                 })
@@ -1180,10 +1296,21 @@ impl An4475 {
         s
     }
 
-    /// 打包 2 MiB 容器。
+    /// 打包 2 MiB 容器（出厂原样：PON 校准表按 BDBOB 原封不动）。
     ///
     /// 身份字段会先回写 `factory_conf`（保持文本与头部一致），再压缩入包。
     pub fn encode_compact(&self) -> Result<Vec<u8>, String> {
+        self.encode_compact_with(CompactOptions::default())
+            .map(|(img, _)| img)
+    }
+
+    /// 打包 2 MiB 容器，并按 `opts` 决定 PON 区怎么处理。
+    ///
+    /// 返回 `(镜像, 上行表处理明细)`；明细供界面和 CLI 打印，正常打包可忽略。
+    pub fn encode_compact_with(
+        &self,
+        opts: CompactOptions,
+    ) -> Result<(Vec<u8>, Vec<PonInline>), String> {
         let files = apply_identity(
             &self.files,
             &self.device_sn,
@@ -1196,6 +1323,7 @@ impl An4475 {
         );
         let mut names: Vec<&String> = files.keys().collect();
         names.sort();
+        let mut inlines: Vec<PonInline> = Vec::new();
         if names.len() > AN_MAX_FILES {
             return Err(format!(
                 "文件数 {} 超过 TOC 上限 {}",
@@ -1247,7 +1375,7 @@ impl An4475 {
                 max_end = max_end.max(AN_EEPROM_FIXED_OFF + raw.len());
                 (raw.clone(), 0u8, AN_EEPROM_FIXED_OFF)
             } else if let Some(at) = cal_offset(name) {
-                // PON 校准表：固定槽 + 原样，槽内剩余保持 0xFF。
+                // PON 校准表：固定槽，槽内剩余保持 0xFF。
                 if raw.len() > AN_CAL_SLOT {
                     return Err(format!(
                         "{name} 有 {} 字节，超出 {} 字节的校准槽",
@@ -1255,8 +1383,19 @@ impl An4475 {
                         AN_CAL_SLOT
                     ));
                 }
-                max_end = max_end.max(at + raw.len());
-                (raw.clone(), 0u8, at)
+                let blob = if opts.pon_aponcal && is_uplink_bob(name) {
+                    let (data, action) = inline_aponcal(raw);
+                    inlines.push(PonInline {
+                        table: (*name).clone(),
+                        offset: at,
+                        action,
+                    });
+                    data
+                } else {
+                    raw.clone()
+                };
+                max_end = max_end.max(at + blob.len());
+                (blob, 0u8, at)
             } else {
                 let packed = zlib(raw);
                 // 压缩收益不足 16 字节就原样存，省得白压一遍。
@@ -1305,7 +1444,7 @@ impl An4475 {
 
         // 载荷长度取「最远写入位置」，固定区的 EEPROM 也算在内。
         put_u32(&mut img, 0x18, (max_end - AN_PAYLOAD_OFF) as u32);
-        Ok(img)
+        Ok((img, inlines))
     }
 }
 
@@ -2147,5 +2286,83 @@ mod tests {
         assert!(rows[..5].iter().all(|r| r.status.exportable()));
         assert_eq!(rows[1].status, PonCalStatus::OkStrict);
         assert_eq!(rows[0].status, PonCalStatus::OkAltSeed(BobCrcSeed::Standard));
+    }
+
+    /// 打开 `pon_aponcal`：5 张上行槽写 APONCAL，下行 olt_table 一字节不动。
+    #[test]
+    fn inline_aponcal_touches_uplink_only() {
+        let mut a = An4475::new();
+        a.files = vec![
+            AnFile { name: "10ge_asym_table".into(), data: bob_fixture(0x2E, BobCrcSeed::Standard) },
+            AnFile { name: "10ge_sym_table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "xg_table".into(), data: bob_fixture(0x2E, BobCrcSeed::Standard) },
+            AnFile { name: "xgs_table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "olt_table".into(), data: bob_fixture(0x27, BobCrcSeed::Standard) },
+        ];
+        let (img, inlines) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: true })
+            .expect("应能打包");
+        assert_eq!(inlines.len(), 5, "只处理上行 5 张");
+        assert!(inlines.iter().all(|r| r.action.ok()), "{:?}", inlines.iter().map(|r| r.action.label()).collect::<Vec<_>>());
+
+        let slot = |i: usize| {
+            let at = AN_CAL_FIXED_OFF + i * AN_CAL_SLOT;
+            &img[at..at + PON_CAL_SIZE]
+        };
+        for i in 0..5 {
+            assert!(slot(i).starts_with(PON_CAL_MAGIC), "槽 {i} 应为 APONCAL");
+            let checks = verify_aponcal(slot(i));
+            assert!(checks.iter().all(|(_, ok)| *ok), "槽 {i} 驱动侧复核: {checks:?}");
+        }
+        assert!(
+            slot(5).starts_with(&AN_BOB_MAGIC[..]),
+            "下行 olt_table（chip 0x27）必须保持原厂 BDBOB"
+        );
+    }
+
+    /// 对已经内联过的镜像再打一次包：不重复转换，产物逐字节相同。
+    #[test]
+    fn inline_aponcal_is_idempotent() {
+        let mut a = An4475::new();
+        a.files = vec![
+            AnFile { name: "10ge_asym_table".into(), data: bob_fixture(0x2E, BobCrcSeed::Standard) },
+            AnFile { name: "table".into(), data: bob_fixture(0x2E, BobCrcSeed::FiberHome) },
+            AnFile { name: "olt_table".into(), data: bob_fixture(0x27, BobCrcSeed::Standard) },
+        ];
+        let opts = CompactOptions { pon_aponcal: true };
+        let (img1, _) = a.encode_compact_with(opts).expect("第一次打包");
+
+        let b = parse_compact(&img1).expect("产物应能读回");
+        assert!(b.cal_tables().iter().any(|t| t.aponcal), "读回时应标出槽里已是 APONCAL");
+        let (img2, inlines) = b.encode_compact_with(opts).expect("第二次打包");
+        assert_eq!(img1, img2, "重复打包必须幂等");
+        assert!(
+            inlines.iter().all(|r| r.action == PonInlineAction::AlreadyApconal),
+            "{:?}",
+            inlines.iter().map(|r| r.action.label()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 转换失败的表保留原样 —— 半张 APONCAL 比原表更危险。
+    #[test]
+    fn inline_aponcal_keeps_corrupt_table() {
+        let mut bad = bob_fixture(0x2E, BobCrcSeed::FiberHome);
+        bad[0x300] ^= 0xff;
+        let mut a = An4475::new();
+        a.files = vec![AnFile { name: "10ge_asym_table".into(), data: bad.clone() }];
+        let (img, inlines) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: true })
+            .expect("坏表不应中断打包");
+        assert_eq!(inlines.len(), 1);
+        assert_eq!(
+            inlines[0].action,
+            PonInlineAction::Kept(PonCalStatus::CrcFail)
+        );
+        assert_eq!(
+            &img[AN_CAL_FIXED_OFF..AN_CAL_FIXED_OFF + 2048],
+            &bad[..],
+            "坏表必须原样留在槽里"
+        );
     }
 }

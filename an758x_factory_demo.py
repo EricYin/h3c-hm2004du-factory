@@ -775,6 +775,9 @@ def an4475_pon_ports(files):
 #      下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支。
 AN_BOB_TABLES = 6
 
+# 上行 5 张 BDBOB 表（第 6 张 olt_table 是下行，chip 0x27 不在 APONCAL 枚举）。
+AN_UPLINK_BOB = AN_CAL_TABLES[:5]
+
 PON_CAL_MAGIC = b"APONCAL\x00"
 PON_CAL_VERSION = 1
 PON_CAL_HEADER_SIZE = 0x80
@@ -857,12 +860,40 @@ def an4475_bob_to_aponcal(data):
     return status, seed, bytes(out)
 
 
+def an4475_inline_aponcal(raw):
+    """打包 2 MiB 时单张上行表的处理：能转就转，转不了原样退回。
+
+    返回 (写进槽的字节, 结果说明)。
+    """
+    if raw.startswith(PON_CAL_MAGIC):
+        return raw, "已是 APONCAL"
+    status, _seed, out = an4475_bob_to_aponcal(raw)
+    if out is not None:
+        return out, "APONCAL · " + status
+    return raw, "保留原表 · " + status
+
+
 def an4475_pon_cal_rows(files):
-    """PON 口 6 张 BDBOB 表逐张跑一遍上游流程，返回结果列表。"""
+    """PON 口 6 张 BDBOB 表逐张跑一遍上游流程，返回结果列表。
+
+    槽里已经是 APONCAL 的（本工具打包过的镜像）直接标出来，不再跑一遍。
+    """
     rows = []
     for i, name in enumerate(AN_CAL_TABLES[:AN_BOB_TABLES]):
         blob = files.get(name)
         if blob is None:
+            continue
+        if blob.startswith(PON_CAL_MAGIC):
+            chip = int.from_bytes(blob[0x0C:0x10], "little")
+            rows.append({
+                "table": name,
+                "offset": AN_CAL_FIXED_OFF + i * AN_CAL_SLOT,
+                "chip_id": 0x2E if chip == 2 else 0x28,
+                "version": "v%d" % int.from_bytes(blob[0x08:0x0A], "little"),
+                "status": "已是 APONCAL",
+                "seed": None,
+                "data": blob,
+            })
             continue
         status, seed, out = an4475_bob_to_aponcal(blob)
         rows.append({
@@ -1389,14 +1420,20 @@ def parse_an4475_mtd9(data):
 # ---- 2 MiB 容器 ----------------------------------------------------------
 
 def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
-                       wifi_2g4=None, wifi_5g=None):
-    """打包 2 MiB 容器。文件按「能压就压」存放，超出容量直接报错。"""
+                       wifi_2g4=None, wifi_5g=None, pon_aponcal=False):
+    """打包 2 MiB 容器。文件按「能压就压」存放，超出容量直接报错。
+
+    pon_aponcal=True 时，上行 5 张 BDBOB 校准表先按 fiberhome-factory 的流程
+    转成 APONCAL 再写进各自的固定槽；下行 olt_table 保持原厂 BDBOB。
+    返回 (镜像, 上行表处理明细)。
+    """
     d24, d5g = an4475_wifi_defaults(base_mac)
     wifi_2g4 = wifi_2g4 or d24
     wifi_5g = wifi_5g or d5g
     files = apply_an4475_identity(files, sn, gpon_sn, gpon_pw, base_mac, eth_mac,
                                   wifi_2g4, wifi_5g)
     names = sorted(files)
+    inlines = []
     if len(names) > AN_MAX_FILES:
         raise ValueError("文件数 %d 超过 TOC 上限 %d" % (len(names), AN_MAX_FILES))
 
@@ -1434,12 +1471,21 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
             at, use, compr = AN_EEPROM_FIXED_OFF, raw, 0
             max_end = max(max_end, at + len(use))
         elif cal_offset(name) is not None:
-            # PON 校准表：固定槽 + 原样，槽内剩余保持 0xFF。
+            # PON 校准表：固定槽，槽内剩余保持 0xFF。
             at = cal_offset(name)
             if len(raw) > AN_CAL_SLOT:
                 raise ValueError("%s 有 %d 字节，超出 %d 字节的校准槽"
                                  % (name, len(raw), AN_CAL_SLOT))
-            use, compr = raw, 0
+            use = raw
+            if pon_aponcal and name in AN_UPLINK_BOB:
+                use, action = an4475_inline_aponcal(raw)
+                inlines.append({
+                    "table": name,
+                    "offset": at,
+                    "action": action,
+                    "ok": action.startswith("APONCAL") or action.startswith("已是"),
+                })
+            compr = 0
             max_end = max(max_end, at + len(use))
         else:
             packed = zlib.compress(raw, 9)
@@ -1471,7 +1517,7 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
         max_end = max(max_end, end)
 
     struct.pack_into("<I", img, 0x18, max_end - AN_PAYLOAD_OFF)
-    return bytes(img)
+    return bytes(img), inlines
 
 
 def is_an4475_compact(data):
@@ -1578,6 +1624,9 @@ def main():
     a.add_argument("--export-pon-cal", metavar="DIR",
                    help="按 fiberhome-factory 流程把 PON 口每张 BDBOB 校准表各转一次，"
                         "逐张写出 APONCAL + pon-cal-report.txt 到 DIR")
+    a.add_argument("--pon-aponcal", action="store_true",
+                   help="生成 2 MiB 时把上行 5 张 BDBOB 校准表按 fiberhome-factory "
+                        "流程转成 APONCAL 再写进固定槽（下行 olt_table 保持原厂）")
 
     args = ap.parse_args()
     if args.cmd == "gen":
@@ -1742,10 +1791,10 @@ def main():
             print("  PON       : olt_bosa_id=%s · pon_mode=%s · uplink_mode=%s"
                   % (bosa, info.get("pon_mode") or "-",
                      info.get("uplink_mode") or "-"))
-            for title, module, sn, driver, names in an4475_pon_ports(files):
+            for title, module, module_sn, driver, names in an4475_pon_ports(files):
                 print("  %s" % title)
                 print("    光模块  : %s%s"
-                      % (module or "-", (" · SN " + sn) if sn else ""))
+                      % (module or "-", (" · SN " + module_sn) if module_sn else ""))
                 print("    驱动    : %s" % driver)
                 for name in names:
                     blob = files.get(name)
@@ -1820,12 +1869,19 @@ def main():
             if not (sn and base and eth and files):
                 sys.exit("生成 2 MiB 需要 --bin 提供出厂文件与身份"
                          "（可再用 --sn/--mac 覆盖）")
-            img = encode_an4475_2mib(sn, gpon_sn, gpon_pw, base, eth, files,
-                                     wifi24, wifi5g)
+            img, inlines = encode_an4475_2mib(sn, gpon_sn, gpon_pw, base, eth, files,
+                                              wifi24, wifi5g, args.pon_aponcal)
             open(args.out, "wb").write(img)
             print("已写出 %d 字节 -> %s" % (len(img), args.out))
             print("  magic     : %r  载荷 %d 字节"
                   % (img[:8], int.from_bytes(img[0x18:0x1C], "little")))
+            if args.pon_aponcal:
+                print("\n上行 PON（按 fiberhome-factory 流程内联）:")
+                for r in inlines:
+                    print("  %-18s 0x%06X  %s" % (r["table"], r["offset"], r["action"]))
+                ok = sum(1 for r in inlines if r["ok"])
+                print("  已转 APONCAL: %d/%d 张（下行 olt_table 不参与：chip 0x27 不在枚举）"
+                      % (ok, len(inlines)))
         if args.export_mt76:
             ee = files.get(AN_WLAN_EEPROM) if files else None
             if ee is None:

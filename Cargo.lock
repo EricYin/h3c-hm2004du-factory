@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "an758x-factory"
-version = "0.8.4"
+version = "0.8.6"
 dependencies = [
  "eframe",
  "flate2",

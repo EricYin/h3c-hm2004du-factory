@@ -83,6 +83,8 @@ struct Editor {
     src_downlink: Option<String>,
     /// 从机 GUD 字符串（只读展示，不参与导出）。
     gud: Vec<(&'static str, String)>,
+    /// 保存 2 MiB 时把上行 5 张 BDBOB 表按 fiberhome 流程内联成 APONCAL。
+    an_pon_aponcal: bool,
 }
 
 impl Editor {
@@ -554,8 +556,22 @@ impl eframe::App for Editor {
                             .clicked()
                         {
                             self.apply_to_an();
-                            match self.an.encode_compact() {
-                                Ok(img) => self.save_image(img, "factory-an4475-2mib.bin"),
+                            let opts = an4475::CompactOptions {
+                                pon_aponcal: self.an_pon_aponcal,
+                            };
+                            match self.an.encode_compact_with(opts) {
+                                Ok((img, inlines)) => {
+                                    self.save_image(img, "factory-an4475-2mib.bin");
+                                    if self.an_pon_aponcal && self.msg.starts_with("已保存") {
+                                        let ok =
+                                            inlines.iter().filter(|r| r.action.ok()).count();
+                                        self.msg.push_str(&format!(
+                                            " · 上行 PON 内联 APONCAL {}/{}",
+                                            ok,
+                                            inlines.len()
+                                        ));
+                                    }
+                                }
                                 Err(e) => self.msg = format!("生成失败: {e}"),
                             }
                         }
@@ -1007,6 +1023,9 @@ impl Editor {
                             if let Some(same) = &t.same_as {
                                 note.push_str(&format!(" · 同 {same}"));
                             }
+                            if t.aponcal {
+                                note.push_str(" · 槽内已是 APONCAL");
+                            }
                             ui.weak(note);
                             // APONCAL 转换状态：只有 6 张 BDBOB 表有，其余 5 张显示 —
                             match pon_rows.iter().find(|r| r.table == t.name) {
@@ -1017,6 +1036,9 @@ impl Editor {
                                         }
                                         an4475::PonCalStatus::OkAltSeed(_) => {
                                             egui::Color32::from_rgb(0xB0, 0x7A, 0x1E)
+                                        }
+                                        an4475::PonCalStatus::AlreadyApconal => {
+                                            egui::Color32::from_rgb(0x1E, 0x6B, 0x9B)
                                         }
                                         _ => egui::Color32::from_rgb(0xB3, 0x26, 0x1E),
                                     };
@@ -1056,6 +1078,19 @@ impl Editor {
                         Err(e) => format!("导出失败: {e}"),
                     };
                 }
+
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.an_pon_aponcal,
+                    "保存 2 MiB 时把上行 5 张内联为 APONCAL",
+                )
+                .on_hover_text(
+                    "打开后，右上「保存 2 MiB」在写固定槽前会先按 fiberhome-factory 的流程\n\
+                     （validate_bdbob → chip 映射 → encode）把 10ge_asym / 10ge_sym / xg /\n\
+                     xgs / table 五张转成 2048 B APONCAL，PonWrt 可直接读。\n\
+                     下行 olt_table（chip 0x27）不在枚举内，保持原厂 BDBOB。\n\
+                     注意：这种镜像 PON 区不再是 BDBOB，原厂 mt_wifi 固件不认。",
+                );
 
                 ui.add_space(4.0);
                 ui.weak("两行「chip id」是校准表头 0x30 那一字节：0x2E = 上行 BOSA 驱动（UX3363/UX3361 同族），0x27 = 下行 UX3326S1。");
@@ -1418,11 +1453,12 @@ fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
     style
 }
 
-/// 无界面批处理：`an758x-factory --export-an <输入> <输出>`。
+/// 无界面批处理：`an758x-factory --export-an <输入> <输出> [--pon-aponcal]`。
 ///
 /// 输入可以是 mtd9 备份，也可以是 1/2 MiB 容器；输出一律 2 MiB。
-/// 用途：产线上没有图形环境时批量转换，也方便脚本回归。
-fn export_an_cli(input: &str, output: &str) {
+/// 加 `--pon-aponcal` 时，上行 5 张 BDBOB 校准表会先按 fiberhome-factory 的流程
+/// 转成 APONCAL 再写进各自的固定槽，产出的镜像 PON 区可直接交给 PonWrt。
+fn export_an_cli(input: &str, output: &str, pon_aponcal: bool) {
     let bytes = match std::fs::read(input) {
         Ok(b) => b,
         Err(e) => {
@@ -1439,19 +1475,40 @@ fn export_an_cli(input: &str, output: &str) {
         eprintln!("无法识别输入（既不是 mtd9 备份，也不是 AN4-* 容器）: {input}");
         return;
     };
-    match a.encode_compact() {
-        Ok(img) => match std::fs::write(output, &img) {
-            Ok(_) => println!(
-                "已写出 {} 字节 -> {output}（{} 个文件，magic {}，EEPROM 固定 0x{:06X}）",
-                img.len(),
-                a.files.len(),
-                String::from_utf8_lossy(&img[..8]),
-                an4475::AN_EEPROM_FIXED_OFF
-            ),
+    let opts = an4475::CompactOptions { pon_aponcal };
+    match a.encode_compact_with(opts) {
+        Ok((img, inlines)) => match std::fs::write(output, &img) {
+            Ok(_) => {
+                println!(
+                    "已写出 {} 字节 -> {output}（{} 个文件，magic {}，EEPROM 固定 0x{:06X}）",
+                    img.len(),
+                    a.files.len(),
+                    String::from_utf8_lossy(&img[..8]),
+                    an4475::AN_EEPROM_FIXED_OFF
+                );
+                if pon_aponcal {
+                    print_pon_inline(&inlines);
+                }
+            }
             Err(e) => eprintln!("写入失败 {output}: {e}"),
         },
         Err(e) => eprintln!("生成失败: {e}"),
     }
+}
+
+/// 打印「上行表内联 APONCAL」的逐张结果，CLI 与界面共用。
+fn print_pon_inline(inlines: &[an4475::PonInline]) {
+    if inlines.is_empty() {
+        println!("\n上行 PON：输入里没有 BDBOB 校准表，未做转换。");
+        return;
+    }
+    println!("\n上行 PON（按 fiberhome-factory 流程内联）:");
+    println!("{:<18} {:>9}  {}", "表名", "槽偏移", "处理结果");
+    for r in inlines {
+        println!("{:<18} 0x{:06X}  {}", r.table, r.offset, r.action.label());
+    }
+    let ok = inlines.iter().filter(|r| r.action.ok()).count();
+    println!("\n已转 APONCAL: {ok}/{} 张（下行 olt_table 不参与：chip 0x27 不在枚举）", inlines.len());
 }
 
 /// 无界面批处理：`an758x-factory --export-pon-cal <输入> <输出目录>`。
@@ -1569,7 +1626,9 @@ fn write_pon_cal_dir(
          · PASS·换种子 表示原厂口径 CRC 不过、标准 zlib 口径通过 —— 表本身完好，\n\
          只是产出工具链不同，payload 与严格通过的那几张同源；\n\
          · chip 0x27（UX3326S1）不在 APONCAL 枚举内（只有 1=GN28L95、2=UX3363），\n\
-         下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支。\n",
+         下行 olt_table 因此不产出文件，硬填枚举值只会让驱动走错 apply 分支；\n\
+         · 「已是 APONCAL」表示该镜像打包时已勾选内联（`--pon-aponcal`），\n\
+         槽里就是成品，原样取出即可，不必再转一次。\n",
     );
     let rp = dir.join("pon-cal-report.txt");
     std::fs::write(&rp, &report).map_err(|e| format!("写报告失败 {}: {e}", rp.display()))?;
@@ -1656,8 +1715,9 @@ fn export_mt76_cli(input: &str, output: &str, carve: bool) {    let bytes = matc
 
 fn main() -> eframe::Result {
     let argv: Vec<String> = std::env::args().collect();
-    if argv.len() == 4 && argv[1] == "--export-an" {
-        export_an_cli(&argv[2], &argv[3]);
+    if argv.len() >= 4 && argv[1] == "--export-an" {
+        let pon = argv[4..].iter().any(|a| a == "--pon-aponcal");
+        export_an_cli(&argv[2], &argv[3], pon);
         return Ok(());
     }
     if argv.len() >= 4 && argv[1] == "--export-mt76" {
@@ -1676,7 +1736,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.8.4",
+        "AN758X Factory 编辑器 v0.8.6",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);
@@ -1698,6 +1758,7 @@ fn main() -> eframe::Result {
                 src_factory: None,
                 src_downlink: None,
                 gud: Vec::new(),
+                an_pon_aponcal: false,
             };
             ed.sync_from_factory();
             // Like upstream: allow `an758x-factory.exe backup.bin`

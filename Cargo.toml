@@ -1,6 +1,6 @@
 [package]
 name = "an758x-factory"
-version = "0.8.4"
+version = "0.8.6"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "AN758X factory partition editor (H3C HM2004-DU / HL202-DU / AN4475) - a Rust/egui port of fiberhome-factory."

@@ -210,6 +210,11 @@ python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin
 # GUI 程序同样带一个无界面批处理入口（产线批量转换用）
 an758x-factory --export-an mtd9_factory.bin factory-an4475-2mib.bin
 an758x-factory --export-mt76 factory-an4475-2mib.bin mt7990_eeprom.bin
+
+# 打包时就把上行 PON 按 fiberhome-factory 流程转成 APONCAL，省一步
+an758x-factory --export-an mtd9_factory.bin factory-an4475-aponcal.bin --pon-aponcal
+python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin \
+    -o factory-an4475-aponcal.bin --pon-aponcal
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
@@ -366,6 +371,26 @@ python3 an758x_factory_demo.py an4475 --bin factory-an4475-2mib.bin --export-pon
 ```
 
 GUI 里在「PON / 光组件」块的表末多一列状态，块底有「全部导出 APONCAL…」按钮，选目录即写 6 个文件 + 报告。
+
+#### 打包时就内联：`--pon-aponcal`
+
+逐张导出适合「镜像已经有了、只想把表抽出来」；如果镜像本来就要重新打包，可以一步到位：
+
+```bash
+an758x-factory --export-an mtd9_factory.bin out.bin --pon-aponcal
+```
+
+打包时对上行 5 张各跑一遍同一套流程，成功了就写进各自的固定槽（`0x1A0000` 起），失败则**保留原表**并在明细里标「保留原表 · 原因」—— 半张 APONCAL 比原表更危险。下行 `olt_table` 无论开关都保持原厂 BDBOB。
+
+| 模式 | 与「原样打包」的差异 |
+|---|---|
+| 不开（默认） | PON 区逐字节相同（实机镜像实测 0 差异） |
+| 开 | 只动 5 个上行槽，共 200 B（每槽的 magic / chip / 版本 / 两处 CRC）；`olt_table` 槽不变 |
+
+重复打包是幂等的：对已内联的镜像再跑一次，明细显示「已是 APONCAL」，产物逐字节相同。
+
+> 这种镜像的 PON 区不再是 BDBOB，**原厂 `mt_wifi` 固件不认**，只适合 PonWrt / OpenWrt。
+> GUI 里对应「保存 2 MiB 时把上行 5 张内联为 APONCAL」复选框。
 
 真机（`factory-an4475-2mib.bin`）实测结果：
 
