@@ -495,6 +495,58 @@ pub fn bob_version(data: &[u8]) -> Option<String> {
     }
 }
 
+/// BOB 表头里的「BOSA 驱动 chip id」字节。
+///
+/// 0x30 这一字节就是光组件驱动芯片的 ID，实机可直接对照 `/etc/rc.d/rcS`：
+/// `i2c_debug getchipid_down` 读到 `0x27` 就 `cp /etc/table.ux3326s /fhdata/olt_table`，
+/// 而 mtd9 里的 `olt_table` 第 0x30 字节正是 0x27。上行 5 张表是 0x2E，
+/// 对应出厂默认表 `/etc/table.ux3361`。
+pub const AN_BOSA_CHIP_ID_OFF: usize = 0x30;
+
+/// 取 BOB 表里的驱动 chip id；非 BOB 表返回 `None`。
+pub fn bosa_chip_id(data: &[u8]) -> Option<u8> {
+    if data.len() <= AN_BOSA_CHIP_ID_OFF || !data.starts_with(AN_BOB_MAGIC) {
+        return None;
+    }
+    Some(data[AN_BOSA_CHIP_ID_OFF])
+}
+
+/// chip id → 驱动型号。取值来自 `/etc/table.*` 的默认表名与 `rcS` 的分支。
+pub fn bosa_chip_name(id: u8) -> &'static str {
+    match id {
+        0x2E => "UX3363（与 UX3361 同驱动）",
+        0x27 => "UX3326S1",
+        0x26 => "UX3326",
+        0x58 => "UX3368",
+        0x99 => "25L99",
+        0x81 => "GN25L81",
+        _ => "未知型号",
+    }
+}
+
+/// BOB 表载荷里的芯片型号明文：上行表在 `0x95`（`ux3363`），
+/// 下行表在 `0x1C4`（`UX3326S1`）。只扫 0x80–0x1FF，避开表头的版本戳。
+pub fn bosa_tag(data: &[u8]) -> Option<String> {
+    let end = data.len().min(0x200);
+    let mut i = 0x80;
+    while i < end {
+        if data[i].is_ascii_alphabetic() {
+            let start = i;
+            let mut j = i + 1;
+            while j < end && (data[j].is_ascii_alphanumeric() || data[j] == b'-') {
+                j += 1;
+            }
+            if j - start >= 5 {
+                return Some(String::from_utf8_lossy(&data[start..j]).to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// 12 个出厂 MAC（基准 + 4 个网络侧派生 + 5 个 LAN + 2 个 Wi-Fi）的重复检查。
 ///
 /// 返回 `(MAC, 用到它的字段列表)`，只列出现 ≥2 次的地址。全 0 / 全 FF 视为
@@ -559,6 +611,28 @@ pub struct CalTableInfo {
     /// 与它逐字节相同的另一张表。实机上 `10ge_sym_table` / `xgs_table` /
     /// `table` 三份内容完全一致 —— 对称 10G 与通用模式复用同一份校准。
     pub same_as: Option<String>,
+    /// 表头 0x30 的 BOSA 驱动 chip id（上行 0x2E / 下行 0x27）。
+    pub chip_id: Option<u8>,
+    /// 表载荷里的型号明文（`ux3363` / `UX3326S1`）。
+    pub tag: Option<String>,
+}
+
+/// 一个 PON 方向的软件可见信息。
+///
+/// 只列「能从校验包里读出来」的东西：光模块型号与序列号来自 `factory_conf`，
+/// 驱动型号来自校准表的 chip id 字节，表名来自固定槽。板级拓扑（Fisilink
+/// CRANE V2R2、AN8831X 等）不在校验包里，界面不臆造。
+pub struct PonPort {
+    /// 「上行 PON（ONT · 接运营商 OLT）」这类标题。
+    pub title: &'static str,
+    /// 光模块 / BOSA 型号，如 `PLDM588-815-C10`。
+    pub module: String,
+    /// 模块序列号（`transceiver_serial` / `lan_optic_serial`）。
+    pub module_sn: String,
+    /// 驱动型号 + chip id，如 `UX3326S1（chip id 0x27）`。
+    pub driver: String,
+    /// 属于这个方向的校准表名。
+    pub tables: Vec<String>,
 }
 
 /// AN4475 的可编辑状态。
@@ -582,6 +656,14 @@ pub struct An4475 {    pub device_sn: String,
     pub pon_mode: String,
     /// 上联模式（`factory_conf` 的 `uplink_mode`，真机 4）。
     pub uplink_mode: String,
+    /// 上行光模块型号（`factory_conf` 的 `transceiver_type`，真机 `PLDM588-815-C10`）。
+    pub transceiver_type: String,
+    /// 上行光模块序列号（`transceiver_serial`）。
+    pub transceiver_sn: String,
+    /// 下行 FTTR 光模块型号（`lan_optic_type`，真机 `PLDM586-552`）。
+    pub lan_optic_type: String,
+    /// 下行 FTTR 光模块序列号（`lan_optic_serial`）。
+    pub lan_optic_sn: String,
     pub files: Vec<AnFile>,
 }
 
@@ -606,6 +688,10 @@ impl An4475 {
             bosa: String::new(),
             pon_mode: String::new(),
             uplink_mode: String::new(),
+            transceiver_type: String::new(),
+            transceiver_sn: String::new(),
+            lan_optic_type: String::new(),
+            lan_optic_sn: String::new(),
             files: Vec::new(),
         }
     }
@@ -641,6 +727,81 @@ impl An4475 {
         self.files.iter().map(|f| f.data.len()).sum()
     }
 
+    /// 上行 / 下行两个 PON 方向的软件可见信息。
+    ///
+    /// 本机是 FTTR 主网关：上行做 ONT（接运营商 OLT），下行做 OLT（带从 ONU），
+    /// 两条路各有一颗 BOSA 驱动芯片，靠校准表的 chip id 字节区分 —— 不是
+    /// 「一颗芯片两个方向」。上行 5 张表的 chip id 都是 0x2E，下行只有
+    /// `olt_table` 一张，chip id 0x27。
+    pub fn pon_ports(&self) -> Vec<PonPort> {
+        let tables = self.cal_tables();
+        const UP: [&str; 5] = [
+            "10ge_asym_table",
+            "10ge_sym_table",
+            "xg_table",
+            "xgs_table",
+            "table",
+        ];
+        let pick = |names: &[&str]| -> Vec<CalTableInfo> {
+            tables
+                .iter()
+                .filter(|t| names.contains(&t.name.as_str()))
+                .map(|t| CalTableInfo {
+                    name: t.name.clone(),
+                    offset: t.offset,
+                    size: t.size,
+                    version: t.version.clone(),
+                    same_as: t.same_as.clone(),
+                    chip_id: t.chip_id,
+                    tag: t.tag.clone(),
+                })
+                .collect()
+        };
+        let drive = |list: &[CalTableInfo]| -> String {
+            match list.first().and_then(|t| t.chip_id) {
+                Some(id) => {
+                    let name = bosa_chip_name(id);
+                    let tag = list.first().and_then(|t| t.tag.clone());
+                    match tag {
+                        Some(t) if !t.eq_ignore_ascii_case(name.split('（').next().unwrap_or("")) => {
+                            format!("{name} · chip id 0x{id:02X} · 表内明文 {t}")
+                        }
+                        _ => format!("{name} · chip id 0x{id:02X}"),
+                    }
+                }
+                None => "—（未读到校准表）".to_string(),
+            }
+        };
+        // 下行 6 项：主校准表 + 两颗 BOSA 的 APD 偏压表（按 olt_bosa_id 选一张）
+        // + RSSI 校准 + LAN 光口 Tx 校准。只有 olt_table 是 BOB 表，其余是 UCI/二进制。
+        const DOWN: [&str; 6] = [
+            "olt_table",
+            "olt_bosa_apd_WTD01",
+            "olt_bosa_apd_YS01",
+            "olt_bosa_info",
+            "olt_bosa_rssi",
+            "LanOpticTxCalib",
+        ];
+        let up = pick(&UP);
+        let down = pick(&DOWN);
+        vec![
+            PonPort {
+                title: "上行 PON（ONT · 接运营商 OLT）",
+                module: self.transceiver_type.clone(),
+                module_sn: self.transceiver_sn.clone(),
+                driver: drive(&up),
+                tables: up.iter().map(|t| t.name.clone()).collect(),
+            },
+            PonPort {
+                title: "下行 FTTR PON（本机作 OLT · 带从 ONU）",
+                module: self.lan_optic_type.clone(),
+                module_sn: self.lan_optic_sn.clone(),
+                driver: drive(&down),
+                tables: down.iter().map(|t| t.name.clone()).collect(),
+            },
+        ]
+    }
+
     /// 11 张固定槽校准表的展示信息，按槽号顺序；容器里没有的表跳过。
     ///
     /// 只读用途：界面上的「PON / 光组件」块靠它列出表名、偏移、版本戳，
@@ -668,6 +829,8 @@ impl An4475 {
                     size: f.data.len(),
                     version: bob_version(&f.data),
                     same_as,
+                    chip_id: bosa_chip_id(&f.data),
+                    tag: bosa_tag(&f.data),
                 })
             })
             .collect()
@@ -705,7 +868,18 @@ impl An4475 {
             ));
         }
         if !self.bosa.is_empty() {
-            s.push_str(&format!("BOSA       : {}\n", self.bosa));
+            s.push_str(&format!("BOSA APD   : {}\n", self.bosa));
+        }
+        let ports = self.pon_ports();
+        for (label, port) in [("上行光模块", &ports[0]), ("下行光模块", &ports[1])] {
+            if port.module.is_empty() {
+                continue;
+            }
+            s.push_str(&format!("{label} : {}", port.module));
+            if !port.module_sn.is_empty() {
+                s.push_str(&format!(" · SN {}", port.module_sn));
+            }
+            s.push_str(&format!(" · {}\n", port.driver));
         }
         if !self.pon_mode.is_empty() || !self.uplink_mode.is_empty() {
             s.push_str(&format!(
@@ -947,6 +1121,10 @@ pub fn parse_compact(data: &[u8]) -> Option<An4475> {
         bosa: bosa_from_files(&files),
         pon_mode: conf_value(&files, "pon_mode"),
         uplink_mode: conf_value(&files, "uplink_mode"),
+        transceiver_type: conf_value(&files, "transceiver_type"),
+        transceiver_sn: conf_value(&files, "transceiver_serial"),
+        lan_optic_type: conf_value(&files, "lan_optic_type"),
+        lan_optic_sn: conf_value(&files, "lan_optic_serial"),
         files,
     })
 }
@@ -1021,6 +1199,10 @@ pub fn parse_mtd9(data: &[u8]) -> Option<An4475> {
         bosa: bosa_from_files(&list),
         pon_mode: conf_value(&list, "pon_mode"),
         uplink_mode: conf_value(&list, "uplink_mode"),
+        transceiver_type: conf_value(&list, "transceiver_type"),
+        transceiver_sn: conf_value(&list, "transceiver_serial"),
+        lan_optic_type: conf_value(&list, "lan_optic_type"),
+        lan_optic_sn: conf_value(&list, "lan_optic_serial"),
         files: list,
     })
 }
@@ -1547,5 +1729,62 @@ mod tests {
 
         // 全 0 是「没填」，不算冲突。
         assert!(mac_conflicts_of(&[0; 6], &[0; 6], &[0; 6], &[0; 6]).is_empty());
+    }
+    /// 表头 0x30 是 BOSA 驱动 chip id，载荷里还有型号明文；两条必须对得上。
+    #[test]
+    fn bosa_chip_identity() {
+        let mut up = vec![0u8; 2048];
+        up[..14].copy_from_slice(b"fiberhomebdbob");
+        up[0x30] = 0x2E;
+        up[0x95..0x9b].copy_from_slice(b"ux3363");
+        assert_eq!(bosa_chip_id(&up), Some(0x2E));
+        assert_eq!(bosa_tag(&up).as_deref(), Some("ux3363"));
+        assert_eq!(bosa_chip_name(0x2E), "UX3363（与 UX3361 同驱动）");
+
+        let mut down = vec![0u8; 2048];
+        down[..14].copy_from_slice(b"fiberhomebdbob");
+        down[0x30] = 0x27;
+        down[0x1C4..0x1CC].copy_from_slice(b"UX3326S1");
+        assert_eq!(bosa_chip_id(&down), Some(0x27));
+        assert_eq!(bosa_tag(&down).as_deref(), Some("UX3326S1"));
+        assert_eq!(bosa_chip_name(0x27), "UX3326S1");
+
+        // 配置文件不是 BOB 表，不该被当成光组件。
+        assert_eq!(bosa_chip_id(b"config key 'x'"), None);
+        assert_eq!(bosa_tag(&[0xff; 2048]), None);
+    }
+
+    /// 上行 / 下行两份表各归各的方向，chip id 不串。
+    #[test]
+    fn pon_ports_split() {
+        let mut a = An4475::new();
+        a.transceiver_type = "PLDM588-815-C10".to_string();
+        a.transceiver_sn = "SNUP".to_string();
+        a.lan_optic_type = "PLDM586-552".to_string();
+        a.lan_optic_sn = "SNDOWN".to_string();
+        let mk = |name: &str, id: u8, tag: &[u8]| {
+            let mut t = vec![0u8; 2048];
+            t[..14].copy_from_slice(b"fiberhomebdbob");
+            t[0x30] = id;
+            t[0x95..0x95 + tag.len()].copy_from_slice(tag);
+            AnFile { name: name.to_string(), data: t }
+        };
+        a.files = vec![
+            mk("10ge_asym_table", 0x2E, b"ux3363"),
+            mk("10ge_sym_table", 0x2E, b"ux3363"),
+            mk("xg_table", 0x2E, b"ux3363"),
+            mk("xgs_table", 0x2E, b"ux3363"),
+            mk("table", 0x2E, b"ux3363"),
+            mk("olt_table", 0x27, b"UX3326S1"),
+        ];
+        let p = a.pon_ports();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].module, "PLDM588-815-C10");
+        assert_eq!(p[0].tables.len(), 5);
+        assert!(p[0].driver.contains("0x2E"), "{}", p[0].driver);
+        assert_eq!(p[1].module, "PLDM586-552");
+        assert_eq!(p[1].tables, vec!["olt_table".to_string()]);
+        assert!(p[1].driver.contains("UX3326S1"), "{}", p[1].driver);
+        assert!(p[1].driver.contains("0x27"), "{}", p[1].driver);
     }
 }

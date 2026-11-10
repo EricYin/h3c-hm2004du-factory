@@ -912,29 +912,19 @@ impl Editor {
         ));
 
         ui.add_space(6.0);
-        // PON 侧只读视图。校准包能证实的只有「模式编码 + BOSA 型号 + 表版本」：
-        // PON MAC 在 SoC 里，数据中没有型号字段，所以这里如实写「SoC 内置」，
-        // 不假装读到了器件型号（H3C 那台能读到 EN7572 明文，本机没有）。
+        // PON 侧只读视图。本机是 FTTR 主网关：上行做 ONT、下行做 OLT，两条路
+        // 各有一颗 BOSA 驱动芯片，靠校准表头 0x30 的 chip id 区分（0x2E / 0x27）。
+        // 光模块型号取自 factory_conf 的 transceiver_* 与 lan_optic_*，不是猜的。
         egui::CollapsingHeader::new("PON / 光组件（只读）")
             .default_open(true)
             .show(ui, |ui| {
                 let tables = self.an.cal_tables();
-                egui::Grid::new("an_pon_grid")
+                let ports = self.an.pon_ports();
+
+                egui::Grid::new("an_pon_mode")
                     .num_columns(2)
                     .spacing([16.0, 3.0])
                     .show(ui, |ui| {
-                        ui.label("PON 主芯片");
-                        ui.monospace("AN7581（SoC 内置 PON MAC · 校准包无型号字段）");
-                        ui.end_row();
-
-                        ui.label("光组件 BOSA");
-                        ui.monospace(if self.an.bosa.is_empty() {
-                            "<未读到 olt_bosa_info>".to_string()
-                        } else {
-                            self.an.bosa.clone()
-                        });
-                        ui.end_row();
-
                         ui.label("PON 模式");
                         ui.monospace(format!(
                             "pon_mode={} · uplink_mode={}（原厂编码）",
@@ -950,25 +940,66 @@ impl Editor {
                             }
                         ));
                         ui.end_row();
-
-                        ui.label("校准表");
-                        ui.monospace(format!(
-                            "{} 张 / {} 个固定槽",
-                            tables.len(),
-                            an4475::AN_CAL_TABLES.len()
-                        ));
+                        ui.label("PON MAC");
+                        ui.monospace("AN7581 SoC 内置（校准包无型号字段）");
+                        ui.end_row();
+                        ui.label("APD 温补");
+                        ui.monospace(if self.an.bosa.is_empty() {
+                            "<未读到 olt_bosa_info>".to_string()
+                        } else {
+                            format!("olt_bosa_id={}（olt_bosa_apd_* / olt_bosa_rssi）", self.an.bosa)
+                        });
                         ui.end_row();
                     });
 
-                ui.add_space(4.0);
+                for (i, port) in ports.iter().enumerate() {
+                    ui.add_space(8.0);
+                    ui.strong(port.title);
+                    egui::Grid::new(format!("an_pon_port_{i}"))
+                        .num_columns(2)
+                        .spacing([16.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label("光模块");
+                            ui.monospace(if port.module.is_empty() {
+                                "—（factory_conf 未写）".to_string()
+                            } else if port.module_sn.is_empty() {
+                                port.module.clone()
+                            } else {
+                                format!("{} · SN {}", port.module, port.module_sn)
+                            });
+                            ui.end_row();
+
+                            ui.label("驱动芯片");
+                            ui.monospace(port.driver.clone());
+                            ui.end_row();
+
+                            ui.label("校准表");
+                            // 网格单元拿不到可用宽度，horizontal_wrapped 会被裁掉；
+                            // 固定每行 3 个名字，窄窗口也稳。
+                            ui.vertical(|ui| {
+                                if port.tables.is_empty() {
+                                    ui.monospace("—");
+                                }
+                                for chunk in port.tables.chunks(3) {
+                                    ui.monospace(chunk.join(" / "));
+                                }
+                            });
+                            ui.end_row();
+                        });
+                }
+
+                ui.add_space(6.0);
                 egui::Grid::new("an_pon_tables")
                     .num_columns(4)
-                    .spacing([16.0, 2.0])
+                    .spacing([14.0, 2.0])
                     .show(ui, |ui| {
                         for t in &tables {
                             ui.monospace(t.name.as_str());
                             ui.monospace(format!("0x{:06X}", t.offset));
-                            ui.monospace(format!("{} B", t.size));
+                            ui.monospace(match t.chip_id {
+                                Some(id) => format!("0x{id:02X}"),
+                                None => "—".to_string(),
+                            });
                             let mut note = t.version.clone().unwrap_or_else(|| "—".to_string());
                             if let Some(same) = &t.same_as {
                                 note.push_str(&format!(" · 同 {same}"));
@@ -979,9 +1010,11 @@ impl Editor {
                     });
 
                 ui.add_space(4.0);
-                ui.weak("「上行」在本机只有一个方向：PON MAC 在 AN7581 内，外部只有一颗 BOSA（olt_bosa_info → olt_bosa_id）。");
-                ui.weak("olt_table / olt_bosa_apd_* / olt_bosa_rssi 按表名与内容是局端（OLT）侧 BOSA 的 APD 偏压-温度 / RSSI / 型号参数，产线校准工具两种形态共用，不代表本机有第二颗下行 PON 芯片。");
-                ui.weak("10ge_sym / xgs / table 三份逐字节相同：对称 10G 与通用模式复用同一份 BOB 校准；10ge_asym 与 xg 各自独立。");
+                ui.weak("两行「chip id」是校准表头 0x30 那一字节：0x2E = 上行 BOSA 驱动（UX3363/UX3361 同族），0x27 = 下行 UX3326S1。");
+                ui.weak("原厂 /etc/rc.d/rcS 用 i2c_debug getchipid_down 读这颗 ID，读到 0x27 就 cp /etc/table.ux3326s /fhdata/olt_table —— 与本机 mtd9 里 olt_table 的头字节完全对得上。");
+                ui.weak("上行接运营商 OLT，下行 FTTR 口本机当 OLT 带从 ONU：两方向各有独立光组件，不是一颗芯片分时复用。板级 SerDes / FTTR ASIC 不在校准包里，故不显示。");
+                ui.weak("下行的 olt_bosa_apd_WTD01 / YS01 是两颗 BOSA 厂商的 APD 偏压-温度表，运行时按 olt_bosa_id 取其中一张。");
+                ui.weak("10ge_sym / xgs / table 三份逐字节相同：对称 10G 与通用模式复用同一份 BOB 校准；10ge_asym 与 xg 只差 11 字节元数据。");
             });
 
         ui.add_space(6.0);
@@ -1470,7 +1503,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.8.2",
+        "AN758X Factory 编辑器 v0.8.3",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

@@ -326,23 +326,30 @@ AN4475 是第三套完全不同的布局：出厂数据**不在裸分区里**，
 
 另有 15 个 `.factory_conf.uci-XXXXXX`，是 UCI 写入时的临时文件（中间态），导入时按「以 `.` 开头」跳过。
 
-### PON / 光组件：界面能显示什么
+### PON / 光组件：上行与下行是两条独立的路
 
-界面上「PON / 光组件（只读）」块给出四项，全部有数据出处：
+这台是 **FTTR 主网关**：上行做 ONT 接运营商 OLT，下行 FTTR 口反过来做 OLT 带从 ONU。两个方向各有一颗光组件和一颗 BOSA 驱动芯片，界面按方向分开列：
 
-| 项 | 实测值 | 来源 |
-|---|---|---|
-| PON 主芯片 | AN7581（SoC 内置 PON MAC） | 机型定义；**校准包里没有器件型号字段** |
-| 光组件 BOSA | `WTD01` | `olt_bosa_info` 的 `olt_bosa_id` |
-| PON 模式 | `pon_mode=7`、`uplink_mode=4` | `factory_conf`（原厂编码，含义未公开） |
-| 11 张校准表 | 表名 / 槽偏移 / 大小 / 版本戳 | `0x1A0000` 起，每张 4 KiB |
+| 方向 | 光模块（`factory_conf`） | 驱动芯片 | 校准表 |
+|---|---|---|---|
+| 上行 PON（ONT） | `PLDM588-815-C10` · SN `000059BTK47068533` | UX3363（chip id `0x2E`） | `10ge_asym` / `10ge_sym` / `xg` / `xgs` / `table`（5 张） |
+| 下行 FTTR PON（OLT） | `PLDM586-552` · SN `000102ADL16001446` | UX3326S1（chip id `0x27`） | `olt_table` + `olt_bosa_apd_*` + `olt_bosa_rssi` + `LanOpticTxCalib`（6 张） |
 
-BOB 表头固定是 `fiberhomebdbob`（14 B）+ 16 B 版本戳，实机六张表为 `202404291559VB`，唯独 `olt_table` 是 `202409230900VA` —— 它显然来自另一批校准。工具把版本戳显示在每张表后面，改表时能一眼看出哪张被替换过。
+以上都不是猜的，三条硬证据：
 
-读这些表容易踩的两个误判：
+1. **`factory_conf` 明文分列**：`transceiver_type` / `transceiver_serial` 是上行光模块，`lan_optic_type` / `lan_optic_serial` 是下行光模块。
+2. **校准表头 `0x30` 就是 BOSA 驱动 chip id**：上行 5 张全是 `0x2E`，`olt_table` 是 `0x27`。`/etc/rc.d/rcS` 里 `i2c_debug getchipid_down` 读到 `0x27` 才 `cp /etc/table.ux3326s /fhdata/olt_table`，与本机 `olt_table` 的头字节完全吻合。
+3. **出厂默认表成对存在**：`/etc/table.ux3361`（`202404291559VB`、`0x2E`）与 `/etc/table.ux3326s`（`202409230900VA`、`0x27`），文件名直接写着驱动型号；`i2c_debug` 支持的芯片串是 `UX3320C / UX3363 / UX33650 / UX3326S1`。
 
-- **本机只有一个 PON 方向**。PON MAC 在 AN7581 内，外部只有一颗 BOSA。`olt_table` / `olt_bosa_apd_WTD01` / `olt_bosa_apd_YS01` / `olt_bosa_rssi` 按表名与内容是**局端（OLT）侧** BOSA 的 APD 偏压-温度 / RSSI / 型号参数，产线校准工具两种形态共用这套表，不代表本机装了第二颗「下行 PON 芯片」。
-- **三份表内容完全相同**：`10ge_sym_table`、`xgs_table`、`table` 逐字节一致（同为 `155a901a…`），对称 10G 与通用模式复用同一份 BOB 校准；`10ge_asym_table`（`86139327…`）与 `xg_table`（`680669fd…`）各自独立。
+`fsl_core_fttr_chip.ko` 的 `description=Fisilink CRANEV2R2 Sys Driver v1.0(2019.02.26)`、`ae_wan.ko` 的 `xsi_set_xsgmii_serdes_an8831_phy_preset` 说明下行还有 FTTR ASIC 与外置 10G PHY 的代码路径，但这些**不在 21 个出厂文件里**，界面只显示校准包能证实的东西，不画板级拓扑。
+
+#### 几处容易误判
+
+- **不是「一颗芯片两个方向」**。`olt_*` 这组确实挂在下行那条路上（`rcS` 的 `#2. olt bosa_driver` 整段包在 `if [ -f /fhconf/multi_lan ]` 里），`olt_bosa_id = WTD01` 是**下行 BOSA 的 APD 偏压/温补型号**，不是上行模块厂商。
+- **`olt_table` 被产线重写过**：它与 `/etc/table.ux3326s` 相差 214 字节（版本戳相同）；而 `LanOpticTxCalib`（536 B）、`olt_bosa_apd_WTD01`（298 B）、`olt_bosa_rssi`（204 B）与 `/fhrom/fhconf/` 出厂默认**逐字节相同** —— 产线只重写了主表。
+- **三份表内容完全相同**：`10ge_sym_table`、`xgs_table`、`table` 逐字节一致（`155a901a…`），对称 10G 与通用模式复用同一份 BOB 校准；`10ge_asym_table`（`86139327…`）与 `xg_table`（`680669fd…`）只差 11 字节元数据（`0x74` 是 payload CRC32）。
+
+BOB 表头固定：`fiberhomebdbob`（14 B）+ 16 B 版本戳 + `0x30` chip id + `0x70` payload 长度 + `0x74` CRC32，载荷从 `0x80` 起 1920 B。上行表的型号明文在 `0x95`（`ux3363`），下行在 `0x1C4`（`UX3326S1`），工具扫 `0x80–0x1FF` 的 ASCII 串，两条都能取到。
 
 ### 身份字段与 MAC 规律
 

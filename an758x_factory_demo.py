@@ -690,6 +690,81 @@ def an4475_bob_version(data):
     return txt or None
 
 
+# BOB 表头 0x30 = BOSA 驱动 chip id；上行 0x2E、下行 0x27（原厂 rcS 用
+# i2c_debug getchipid_down 读这个值再决定拷哪张 /etc/table.* 默认表）。
+AN_BOSA_CHIP_ID_OFF = 0x30
+
+AN_BOSA_CHIP_NAMES = {
+    0x2E: "UX3363（与 UX3361 同驱动）",
+    0x27: "UX3326S1",
+    0x26: "UX3326",
+    0x58: "UX3368",
+    0x99: "25L99",
+    0x81: "GN25L81",
+}
+
+# 上行 5 张 / 下行 6 张固定槽校准表，按方向分组。
+AN_PON_UP_TABLES = ["10ge_asym_table", "10ge_sym_table", "xg_table",
+                    "xgs_table", "table"]
+AN_PON_DOWN_TABLES = ["olt_table", "olt_bosa_apd_WTD01", "olt_bosa_apd_YS01",
+                      "olt_bosa_info", "olt_bosa_rssi", "LanOpticTxCalib"]
+
+
+def an4475_bosa_chip_id(data):
+    """表头 0x30 的 BOSA 驱动 chip id；非 BOB 表返回 None。"""
+    if len(data) <= AN_BOSA_CHIP_ID_OFF or not data.startswith(AN_BOB_MAGIC):
+        return None
+    return data[AN_BOSA_CHIP_ID_OFF]
+
+
+def an4475_bosa_chip_name(chip_id):
+    return AN_BOSA_CHIP_NAMES.get(chip_id, "未知型号")
+
+
+def an4475_bosa_tag(data):
+    """载荷里的型号明文（上行 0x95 的 ux3363、下行 0x1C4 的 UX3326S1）。"""
+    end = min(len(data), 0x200)
+    i = 0x80
+    while i < end:
+        c = data[i]
+        if chr(c).isalpha():
+            j = i + 1
+            while j < end and (chr(data[j]).isalnum() or data[j:j + 1] == b"-"):
+                j += 1
+            if j - i >= 5:
+                return data[i:j].decode("ascii", "ignore")
+            i = j
+        else:
+            i += 1
+    return None
+
+
+def an4475_pon_ports(files):
+    """上行 / 下行两个方向的软件可见信息，字段与原厂 factory_conf 一一对应。"""
+    def conf(key):
+        return _uci_get(files.get("factory_conf", b"").decode("utf-8", "ignore"), key)
+
+    def drive(names):
+        for n in names:
+            blob = files.get(n)
+            if blob is None:
+                continue
+            cid = an4475_bosa_chip_id(blob)
+            if cid is None:
+                continue
+            return "%s · chip id 0x%02X" % (an4475_bosa_chip_name(cid), cid)
+        return "—（未读到校准表）"
+
+    return [
+        ("上行 PON（ONT · 接运营商 OLT）", conf("transceiver_type"),
+         conf("transceiver_serial"), drive(AN_PON_UP_TABLES),
+         [n for n in AN_PON_UP_TABLES if n in files]),
+        ("下行 FTTR PON（本机作 OLT · 带从 ONU）", conf("lan_optic_type"),
+         conf("lan_optic_serial"), drive(AN_PON_DOWN_TABLES),
+         [n for n in AN_PON_DOWN_TABLES if n in files]),
+    ]
+
+
 def cal_offset(name):
     """校准表名 -> 直读区偏移；不在槽表里返回 None（走压缩区）。"""
     if name in AN_CAL_TABLES:
@@ -1502,16 +1577,21 @@ def main():
                     print("    警告: device id 0x%04X != 0x7993，可能不是 MT7990AN"
                           % devid)
             bosa = info.get("bosa") or "-"
-            print("  PON       : BOSA %s · pon_mode=%s · uplink_mode=%s"
+            print("  PON       : olt_bosa_id=%s · pon_mode=%s · uplink_mode=%s"
                   % (bosa, info.get("pon_mode") or "-",
                      info.get("uplink_mode") or "-"))
-            for name in AN_CAL_TABLES:
-                blob = files.get(name)
-                if blob is None:
-                    continue
-                print("    %-22s %6d B  0x%06X  %s"
-                      % (name, len(blob), cal_offset(name),
-                         an4475_bob_version(blob) or "-"))
+            for title, module, sn, driver, names in an4475_pon_ports(files):
+                print("  %s" % title)
+                print("    光模块  : %s%s"
+                      % (module or "-", (" · SN " + sn) if sn else ""))
+                print("    驱动    : %s" % driver)
+                for name in names:
+                    blob = files.get(name)
+                    cid = an4475_bosa_chip_id(blob)
+                    print("    %-22s %6d B  0x%06X  %s%s"
+                          % (name, len(blob), cal_offset(name),
+                             an4475_bob_version(blob) or "-",
+                             ("  chip 0x%02X" % cid) if cid else ""))
             print("  出厂文件  : %d 个，共 %d 字节"
                   % (len(files), sum(len(v) for v in files.values())))
             for name in sorted(files):
