@@ -748,9 +748,24 @@ AN_EEPROM_MAC_AREA = 0x10           # 0x10 起为 0 填充，MAC 区到此为止
 AN_APMAC_2G4 = "APMAC_1"
 AN_APMAC_5G = "APMAC_2"
 
-# 本工具约定的 Wi-Fi MAC 偏移（真机未写，无出厂实证，可在界面改）。
-AN_WIFI_OFFSET_2G4 = 6
+# 原厂 Wi-Fi MAC 派生规则，出自 rootfs 的两个脚本（逐字相同）：
+#   /fhrom/fhshell/fac_start_wifi.sh     产测模式生成 /var/wlan/apcfg
+#   /fhrom/fhshell/generate_wifi_mac.sh  生成 mt7990.1.dualband.dat
+#     mac2 = brmac[3:5] + 1
+#     ra0_mac  = mac1:mac2:mac3:mac4:mac5:mac6       2.4G，末字节不变
+#     rai0_mac = mac1:mac2:mac3:mac4:mac5:(mac6+8)   5G，末字节 +8
+# EEPROM 的 +0x04/+0x0A 原厂从不写（实机仍是 00:0C:43:26:60:10/11）。
+AN_WIFI_OFFSET_2G4 = 6   # 仅用于界面提示「第 2 字节 +1」的等价说法
 AN_WIFI_OFFSET_5G = 7
+
+
+def an4475_wifi_mac(base_mac, band_5g):
+    """按原厂脚本的规则派生 Wi-Fi MAC。"""
+    v = bytearray(base_mac)
+    v[1] = (v[1] + 1) & 0xFF
+    if band_5g:
+        v[5] = (v[5] + 8) & 0xFF
+    return bytes(v)
 
 
 def _mac_add(mac, n):
@@ -766,14 +781,9 @@ def an4475_derive(base_mac, eth_mac):
 
 
 def an4475_wifi_defaults(base_mac):
-    """Wi-Fi 两位 MAC 的默认值。
-
-    真机出厂时 EEPROM 和 factory_conf 里都是芯片厂/OEM 占位值，没有可参照的
-    真实值，所以这里按基准 MAC 往后取两个未被占用的偏移（+6/+7）。纯约定，
-    界面上可改。
-    """
-    return (_mac_add(base_mac, AN_WIFI_OFFSET_2G4),
-            _mac_add(base_mac, AN_WIFI_OFFSET_5G))
+    """Wi-Fi 两位 MAC 的默认值，按原厂 fac_start_wifi.sh 的派生规则算。"""
+    return (an4475_wifi_mac(base_mac, False),
+            an4475_wifi_mac(base_mac, True))
 
 
 def an4475_eeprom_device_id(eeprom):
@@ -783,13 +793,24 @@ def an4475_eeprom_device_id(eeprom):
     return int.from_bytes(eeprom[:2], "little")
 
 
+def an4475_is_placeholder_mac(mac):
+    """芯片厂 / OEM 占位 MAC：MediaTek 的 00:0C:43、原厂 APMAC 占位的 00:0A:C2、全 0 / 全 FF。"""
+    if mac in (b"\x00" * 6, b"\xff" * 6):
+        return True
+    return mac[:3] in (b"\x00\x0c\x43", b"\x00\x0a\xc2")
+
+
 def an4475_eeprom_macs(eeprom):
-    """读 EEPROM 里的 (2.4G, 5G) MAC；太短或全 0 时返回 None。"""
+    """读 EEPROM 里的 (2.4G, 5G) MAC；太短、全 0 或仍是芯片厂占位值时返回 None。
+
+    原厂产线从不写这两处（实机始终是 MediaTek 默认的 00:0C:43:26:60:10/11），
+    导入备份时要按 brmac 现算，否则整批机器同 MAC。
+    """
     if len(eeprom) < AN_EEPROM_MAC_5G + 6:
         return None
     a = bytes(eeprom[AN_EEPROM_MAC_2G4:AN_EEPROM_MAC_2G4 + 6])
     b = bytes(eeprom[AN_EEPROM_MAC_5G:AN_EEPROM_MAC_5G + 6])
-    if a in (b"\x00" * 6, b"\xff" * 6):
+    if an4475_is_placeholder_mac(a):
         return None
     return a, b
 
@@ -1061,13 +1082,17 @@ def parse_an4475_mtd9(data):
     eeprom = files.get(AN_WLAN_EEPROM, b"")
     eep_macs = an4475_eeprom_macs(eeprom)
     base_mac = parse_mac(_uci_get(text, "base_mac")) or b"\x00" * 6
-    # EEPROM 里的值才是驱动实际读到的，优先用它；缺失时退回 factory_conf 的
-    # APMAC_1/2，再退到按基准 MAC 推算的约定值。
+    # 原厂不写 EEPROM 的 MAC，也不写 APMAC_1/2，Wi-Fi MAC 一律由 brmac 现算。
+    # 所以顺序是：「真写过」的 EEPROM 值 > 「真写过」的 APMAC > 按 brmac 派生。
     d24, d5g = an4475_wifi_defaults(base_mac)
-    wifi_2g4 = (eep_macs[0] if eep_macs else None) or parse_mac(
-        _uci_get(text, AN_APMAC_2G4)) or d24
-    wifi_5g = (eep_macs[1] if eep_macs else None) or parse_mac(
-        _uci_get(text, AN_APMAC_5G)) or d5g
+    apmac24 = parse_mac(_uci_get(text, AN_APMAC_2G4))
+    apmac5g = parse_mac(_uci_get(text, AN_APMAC_5G))
+    if apmac24 and an4475_is_placeholder_mac(apmac24):
+        apmac24 = None
+    if apmac5g and an4475_is_placeholder_mac(apmac5g):
+        apmac5g = None
+    wifi_2g4 = (eep_macs[0] if eep_macs else None) or apmac24 or d24
+    wifi_5g = (eep_macs[1] if eep_macs else None) or apmac5g or d5g
     return {
         "sn": _uci_get(text, "SerialNumber")[:AN_SN_SIZE],
         "gpon_sn": gpon_sn,
@@ -1467,10 +1492,10 @@ def main():
             d24, d5g = an4475_wifi_defaults(base)
             print("  2.4G MAC  : %s%s"
                   % (mac_to_string(wifi24 or d24),
-                     "" if wifi24 else "（约定默认 +%d）" % AN_WIFI_OFFSET_2G4))
+                     "" if wifi24 else "（原厂规则：第 2 字节 +1）"))
             print("  5G MAC    : %s%s"
                   % (mac_to_string(wifi5g or d5g),
-                     "" if wifi5g else "（约定默认 +%d）" % AN_WIFI_OFFSET_5G))
+                     "" if wifi5g else "（原厂规则：第 2 字节 +1、末字节 +8）"))
         if args.out:
             if not (sn and base and eth and files):
                 sys.exit("生成 2 MiB 需要 --bin 提供出厂文件与身份"

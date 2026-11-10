@@ -832,12 +832,12 @@ impl Editor {
                 self.an.base_mac = m;
                 self.label_mac = an4475::mac_to_string(&m);
                 // Wi-Fi 两位若还停在旧的派生值上，就跟着一起走；手改过的不动。
-                if self.an.wifi_2g4 == an4475::mac_add(&old, an4475::AN_WIFI_OFFSET_2G4) {
-                    self.an.wifi_2g4 = an4475::mac_add(&m, an4475::AN_WIFI_OFFSET_2G4);
+                if self.an.wifi_2g4 == an4475::an_wifi_mac(&old, false) {
+                    self.an.wifi_2g4 = an4475::an_wifi_mac(&m, false);
                     self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
                 }
-                if self.an.wifi_5g == an4475::mac_add(&old, an4475::AN_WIFI_OFFSET_5G) {
-                    self.an.wifi_5g = an4475::mac_add(&m, an4475::AN_WIFI_OFFSET_5G);
+                if self.an.wifi_5g == an4475::an_wifi_mac(&old, true) {
+                    self.an.wifi_5g = an4475::an_wifi_mac(&m, true);
                     self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
                 }
             }
@@ -881,8 +881,8 @@ impl Editor {
                 );
                 if ui.button("按基准 MAC 派生").clicked() {
                     let b = an4475::parse_mac(&self.label_mac).unwrap_or(self.an.base_mac);
-                    self.an.wifi_2g4 = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_2G4);
-                    self.an.wifi_5g = an4475::mac_add(&b, an4475::AN_WIFI_OFFSET_5G);
+                    self.an.wifi_2g4 = an4475::an_wifi_mac(&b, false);
+                    self.an.wifi_5g = an4475::an_wifi_mac(&b, true);
                     self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
                     self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
                 }
@@ -897,6 +897,7 @@ impl Editor {
                 ui.end_row();
             });
         ui.add_space(5.0);
+        ui.weak("原厂规则：第 2 字节 +1，5G 末字节再 +8（fac_start_wifi.sh）；原厂不写 EEPROM 里的 MAC，本工具两处都写。");
         ui.weak(format!(
             "写 EEPROM +{:#04X}/+{:#04X} 与 factory_conf 的 APMAC_1/APMAC_2；device id {}",
             an4475::AN_EEPROM_MAC_2G4,
@@ -1378,7 +1379,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.6.0",
+        "AN758X Factory 编辑器 v0.8.0",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

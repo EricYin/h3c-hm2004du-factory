@@ -449,9 +449,67 @@ eeprom_factory: eeprom@1ab000 { reg = <0x1ab000 0x1e00>; };
 - EEPROM 其余 1.32 MiB（含全部校准表）逐字节原样保留，只动这 12 字节
 - 导入时若 EEPROM 的 device id 不是 `0x7993`，界面会标出来
 
-> 派生偏移取 `+6`/`+7`（基准 MAC 段内 `+1/+2/+3/+8` 已被上网/TR-069/VoIP/私有协议占用，`+4/+5` 在 H3C 机型上是 5G/2.4G，为避开冲突往后取）。**这是本工具的约定，没有出厂实证** —— 真机两处都是厂默认值，无从反推。有实测值就在界面上直接改。
+> **原厂规则（脚本实证）**：rootfs 里 `fhrom/fhshell/fac_start_wifi.sh` 与 `generate_wifi_mac.sh` 两处算法逐字相同 —— `brmac` 的**第 2 字节 +1**，5G 再把**末字节 +8**，2.4G 末字节不变；两个字节都是 u8 回绕，不向邻近字节进位。以本机 `brmac = D4:9F:29:04:E7:50` 为例：
+>
+> | 接口 | 值 | 算法 |
+> |---|---|---|
+> | `ra0`（2.4G） | `D4:A0:29:04:E7:50` | 第 2 字节 `9F`→`A0` |
+> | `rai0`（5G） | `D4:A0:29:04:E7:58` | 第 2 字节 `9F`→`A0`，末字节 `50`→`58` |
+>
+> 原厂**不写** EEPROM 的 `+0x04/+0x0A`（实机仍是 MediaTek 默认值），也不写 `APMAC_1/APMAC_2`（仍是 `00:0a:c2:d6:00:00` 占位），只把派生值写进 profile 的 `MacAddress`。本工具沿用同一算法，但为了 mt76 侧也能取到，额外把结果写进 EEPROM 与 `factory_conf`。
+
+**导入时会把占位值当「未写」处理**：`00:0C:43`（MediaTek OUI）、`00:0A:C2`（原厂 APMAC 占位）、全 `00`、全 `FF` 一律判为占位，改用 `brmac` 现算，避免整批机器带着同一个 MAC 出厂。判断逻辑在 `an4475::is_placeholder_mac()`，Python 侧同名函数 `an4475_is_placeholder_mac()`。
 
 > 压缩实现差异：Rust 侧用 `miniz_oxide`、Python 侧用 `zlib`，同一份输入打出来的**压缩字节可能不同**（本次实测载荷 218 787 vs 210 969 字节），**解压后的文件内容完全一致**。跨语言比对请比内容，不要比整个镜像的 MD5。
+
+### 原厂是怎么处理 Wi-Fi 校准的（完整备份实证）
+
+拿到整机 7 个分区的原厂备份后，机制可以逐条落地了 —— **原厂跑的是 `mt_wifi`（厂商驱动），不是 mt76**，1.35 MB 与 7 680 B 是**同一文件的两个阶段**，不是两种格式的两份文件。
+
+**分区表**（地址取自 `mtd2_KernelA` 里的 FDT）：
+
+| 分区 | 文件 | 大小 | flash 偏移 |
+|---|---|---|---|
+| `mtd0` | `bootloader.bin` | 2.5 MiB | `0x0` |
+| `mtd1` | `bootflag.bin` | 512 KiB | — |
+| `mtd2` | `KernelA.bin` | 32 MiB | —（FDT 在此分区内，分区表就从这里读出） |
+| `mtd3` | `RootfsA.bin` | 108 MiB | `0x2300000`（squashfs，xz） |
+| `mtd6` | `apps.bin` | 132 MiB | `0x11B00000`（UBI） |
+| `mtd7` | `frameworka.bin` | 16 MiB | `0x19F00000`（squashfs） |
+| `mtd9` | `factory.bin` | 25 MiB | `0x1BF00000`（UBI，烧的是 `fhdata_ubi.img`） |
+
+**mtd9 内部**：UBI（PEB 128 KiB × 200），只挂一个动态卷 `fhdata`，卷上是 UBIFS，共 21 个出厂文件。**`MT7993_EEPROM.bin` 位于 `/fhdata/wlan/` 下**，1 353 728 B，在 UBIFS 里按 zlib 分成 331 个数据块存放（整卷实际只占约 1.6 MB，其余 23 MB 是空的）。
+
+**驱动怎么找校准**（`mt_wifi.ko` 里的字符串即证据）：
+
+```
+/fhdata/wlan/%s                                    ← 第一优先（产测写入的 1.35 MB）
+/lib/firmware/MT7993_EEPROM.bin                    ← 默认 bin（7 680 B）
+/lib/firmware/MT7993_MT7976_EEPROM_BE3600_iPAiLNA.bin
+/lib/firmware/MT7993_MT7976_EEPROM_BE3600_ePAeLNA.bin
+"Use default BIN from:%s." / "Unexpected error with default BIN."
+```
+
+启动脚本 `/etc/insmod_wifi7_BE3600.sh` 先把固件搜索路径改到 `/etc/wireless`，再依次 `insmod` `mt_wifi.ko` → `mtk_hwifi.ko` → `connac_if.ko` → `mtk_pci.ko` → `mt7993.ko`（`option_type=1 rro_mode=5`）→ `mt799b.ko`。
+
+**rootfs 里那三份 7 680 B 的关系**（与你手头的 zip 逐字节一致）：
+
+| 路径 | MD5 | 作用 |
+|---|---|---|
+| `/lib/firmware/MT7993_EEPROM.bin` | `74abc9a1…` | = `_iPAiLNA`，驱动默认 bin |
+| `/lib/firmware/…_BE3600_iPAiLNA.bin` | `74abc9a1…` | 同一文件，按 FEM 变体命名的一份 |
+| `/lib/firmware/…_BE3600_ePAeLNA.bin` | `9ff6b18e…` | ePA 变体，本机 `0x196=08` 不匹配，不会用 |
+| `/etc/MT7993_EEPROM.bin` | `6b7aa278…` | 产测占位用，与默认版差 342 B，全在功率表（`0x1300` 低 2、`RATE_DELTA` 低 1~6） |
+
+**产测流程**（`fac_start_wifi.sh` 的 `copy_cal_file`）：
+
+1. 只有存在 `/fhdata/factorymodeflag` 时才执行
+2. 若 `/fhdata/wlan/MT7993_EEPROM.bin` 不存在 → `cp /etc/MT7993_EEPROM.bin /fhdata/wlan/`，即先用 7 680 B 占位，保证驱动能起来
+3. 产线工具随后把逐台校准的 1.35 MB 覆盖上去（实机就是这么来的：`factorymodeflag` 还在，文件已是 1.35 MB）
+
+**关键结论**：产测覆盖后，**前 `0x1000` 只动了 10 个字节**（`0x44C–0x450`、`0xB91/B95/B99`、`0xBA8/BAA`，逐台通道偏置），而 **`0x1000–0x1DFF` 被整段换成厂商自己的编码**（`0xFF` 占 80%，与默认版 `0x00` 占 72% 完全不同）。也就是说 `0x1000` 往后在 `mt_wifi` 眼里根本不是 mt76 的 dBm 功率表 —— 这也解释了为什么把 1.35 MB 前 7 680 B 直接喂给 mt76 不能用。
+
+> 反过来看 `0x1E00–0x14A7FF` 那 1.34 MB：按 2 KiB 切片统计，每片稳定是 `0xFF` 80% 上下、数据 5–16%，是典型的「逐信道 × 逐速率稀疏表」，与 `0x1000` 段同一种编码，只是往后延续。原厂把它当私有校准区，mt76 连读都不读。
 
 ### mt76 / OpenWrt：7 680 B 的 EEPROM 视图
 

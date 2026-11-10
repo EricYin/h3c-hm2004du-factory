@@ -217,9 +217,30 @@ pub const AN_EEPROM_MAC_5G: usize = 0x0a;
 pub const AN_APMAC_2G4: &str = "APMAC_1";
 pub const AN_APMAC_5G: &str = "APMAC_2";
 
-/// 本工具约定的 Wi-Fi MAC 偏移（真机未写，无出厂实证，界面可改）。
-pub const AN_WIFI_OFFSET_2G4: u8 = 6;
-pub const AN_WIFI_OFFSET_5G: u8 = 7;
+/// 原厂 Wi-Fi MAC 派生规则，出自 rootfs 里的两个 shell 脚本：
+///
+/// * `/fhrom/fhshell/fac_start_wifi.sh`（产测模式，生成 `/var/wlan/apcfg`）
+/// * `/fhrom/fhshell/generate_wifi_mac.sh`（生成 `mt7990.1.dualband.dat`）
+///
+/// 两处的算法逐字相同：
+///
+/// ```sh
+/// mac2 = brmac[3:5] + 1      # 第 2 字节 +1
+/// ra0_mac  = mac1:mac2:mac3:mac4:mac5:mac6            # 2.4G，末字节不变
+/// rai0_mac = mac1:mac2:mac3:mac4:mac5:(mac6 + 8)      # 5G，末字节 +8
+/// ```
+///
+/// 也就是说 **EEPROM 里的 `+0x04` / `+0x0A` 原厂从不写**（实机仍是 MediaTek
+/// 默认的 `00:0C:43:26:60:10/11`），Wi-Fi MAC 是在用户态由 `brmac` 现算、
+/// 写进 profile 的 `MacAddress` / `MacAddress1`。本工具沿用同一算法。
+pub fn an_wifi_mac(base: &[u8; 6], band_5g: bool) -> [u8; 6] {
+    let mut v = *base;
+    v[1] = v[1].wrapping_add(1);
+    if band_5g {
+        v[5] = v[5].wrapping_add(8);
+    }
+    v
+}
 
 /// 本机 Wi-Fi 方案的数字基带是 **MT7990AN**（配套射频前端 MT7976CN，双频
 /// 2.4G/5G、无 6G），device id 即 `0x7993`。
@@ -458,8 +479,8 @@ impl An4475 {
             gpon_pw: String::new(),
             base_mac: [0x02, 0, 0, 0, 0, 0],
             eth_mac: [0x02, 0, 0, 0, 1, 0],
-            wifi_2g4: mac_add(&[0x02, 0, 0, 0, 0, 0], AN_WIFI_OFFSET_2G4),
-            wifi_5g: mac_add(&[0x02, 0, 0, 0, 0, 0], AN_WIFI_OFFSET_5G),
+            wifi_2g4: an_wifi_mac(&[0x02, 0, 0, 0, 0, 0], false),
+            wifi_5g: an_wifi_mac(&[0x02, 0, 0, 0, 0, 0], true),
             eeprom_id: 0,
             vendor: "FH".to_string(),
             bosa: String::new(),
@@ -792,25 +813,27 @@ pub fn parse_mtd9(data: &[u8]) -> Option<An4475> {
     let base_mac = uci_get(&conf, "base_mac")
         .and_then(|s| parse_mac(&s))
         .unwrap_or([0u8; 6]);
-    // EEPROM 里的值才是驱动实际读到的，优先用它；缺失时退回 APMAC_1/2，
-    // 再退到按基准 MAC 推算的约定值。
+    // 原厂**不写** EEPROM 的 MAC（实机仍是 MediaTek 默认的 00:0C:43:26:60:10/11），
+    // 也不写 APMAC_1/2，Wi-Fi MAC 一律由 brmac 现算。所以这里的顺序是：
+    // 「真写过」的 EEPROM 值 > 「真写过」的 APMAC > 按 brmac 派生。
     let eep = list.iter().find(|f| f.name == AN_EEPROM);
+    let conf_mac = |key: &str| {
+        uci_get(&conf, key)
+            .and_then(|s| parse_mac(&s))
+            .filter(|m| !is_placeholder_mac(m))
+    };
     let (mut wifi_2g4, mut wifi_5g) = match eep.and_then(|f| eeprom_macs(&f.data)) {
         Some((a, b)) => (a, b),
         None => (
-            uci_get(&conf, AN_APMAC_2G4)
-                .and_then(|s| parse_mac(&s))
-                .unwrap_or_else(|| mac_add(&base_mac, AN_WIFI_OFFSET_2G4)),
-            uci_get(&conf, AN_APMAC_5G)
-                .and_then(|s| parse_mac(&s))
-                .unwrap_or_else(|| mac_add(&base_mac, AN_WIFI_OFFSET_5G)),
+            conf_mac(AN_APMAC_2G4).unwrap_or_else(|| an_wifi_mac(&base_mac, false)),
+            conf_mac(AN_APMAC_5G).unwrap_or_else(|| an_wifi_mac(&base_mac, true)),
         ),
     };
     if wifi_2g4 == [0u8; 6] {
-        wifi_2g4 = mac_add(&base_mac, AN_WIFI_OFFSET_2G4);
+        wifi_2g4 = an_wifi_mac(&base_mac, false);
     }
     if wifi_5g == [0u8; 6] {
-        wifi_5g = mac_add(&base_mac, AN_WIFI_OFFSET_5G);
+        wifi_5g = an_wifi_mac(&base_mac, true);
     }
     let eeprom_id = eep.map(|f| eeprom_device_id(&f.data)).unwrap_or(0);
 
@@ -1037,6 +1060,19 @@ fn apply_identity(
 // ---- Wi-Fi EEPROM -------------------------------------------------------
 
 /// 读 EEPROM 里的 (2.4G, 5G) MAC；太短或全 0/全 FF 时返回 None。
+/// 芯片厂 / OEM 的占位 MAC —— 原厂从不把它们当作「已写」。
+///
+/// * `00:0C:43` 是 **MediaTek 自己的 OUI**，EEPROM 模板里就是 `…:26:60:10/11`
+/// * `00:0A:C2` 是原厂 `factory_conf` 里 `APMAC_1/APMAC_2` 的占位前缀
+/// * 全 `00` / 全 `FF` 是未烧写的空值
+///
+/// 导入备份时遇到这些值，说明产线没写，应按 `brmac` 现算，而不是把它们当身份
+/// 原样带进新镜像（否则整批机器同 MAC）。
+pub fn is_placeholder_mac(m: &[u8; 6]) -> bool {
+    let oui = [m[0], m[1], m[2]];
+    oui == [0x00, 0x0C, 0x43] || oui == [0x00, 0x0A, 0xC2] || *m == [0u8; 6] || *m == [0xFFu8; 6]
+}
+
 pub fn eeprom_macs(eeprom: &[u8]) -> Option<([u8; 6], [u8; 6])> {
     if eeprom.len() < AN_EEPROM_MAC_5G + 6 {
         return None;
@@ -1045,7 +1081,7 @@ pub fn eeprom_macs(eeprom: &[u8]) -> Option<([u8; 6], [u8; 6])> {
     let mut b = [0u8; 6];
     a.copy_from_slice(&eeprom[AN_EEPROM_MAC_2G4..AN_EEPROM_MAC_2G4 + 6]);
     b.copy_from_slice(&eeprom[AN_EEPROM_MAC_5G..AN_EEPROM_MAC_5G + 6]);
-    if a == [0u8; 6] || a == [0xff; 6] {
+    if is_placeholder_mac(&a) {
         return None;
     }
     Some((a, b))
@@ -1196,6 +1232,18 @@ mod tests {
     fn mac_carry() {
         let base = [0x00, 0x11, 0x22, 0x33, 0x44, 0xff];
         assert_eq!(mac_to_string(&mac_add(&base, 1)), "00:11:22:33:45:00");
+    }
+
+    /// 原厂 fac_start_wifi.sh 的实测算例：本机 brmac = D4:9F:29:04:E7:50。
+    #[test]
+    fn an_wifi_mac_matches_vendor_script() {
+        let base = [0xD4, 0x9F, 0x29, 0x04, 0xE7, 0x50];
+        assert_eq!(mac_to_string(&an_wifi_mac(&base, false)), "D4:A0:29:04:E7:50");
+        assert_eq!(mac_to_string(&an_wifi_mac(&base, true)), "D4:A0:29:04:E7:58");
+        // 第二字节与末字节都要按 u8 回绕，不向邻近字节进位。
+        let b2 = [0x00, 0xFF, 0x22, 0x33, 0x44, 0xF8];
+        assert_eq!(mac_to_string(&an_wifi_mac(&b2, false)), "00:00:22:33:44:F8");
+        assert_eq!(mac_to_string(&an_wifi_mac(&b2, true)), "00:00:22:33:44:00");
     }
 
     #[test]
