@@ -66,7 +66,8 @@ struct Editor {
     an: An4475,
     /// AN4475 的 LAN 基址 MAC（eth1mac），与基准 MAC 是两段地址。
     eth_mac: String,
-    /// AN4475 的 GPON SN（16 位 hex，含 "FHTT" 厂商码）。
+    /// AN4475 的 GPON SN，按 fiberhome-factory 的写法显示：
+    /// `FHTT` + 8 位 hex（12 字符）或 16 位 hex，两种输入都收。
     gpon_sn: String,
     /// AN4475 的 GPON 密码（10 字符 ASCII）。
     gpon_pw: String,
@@ -116,13 +117,18 @@ impl Editor {
         self.device_sn = self.an.device_sn.clone();
         self.label_mac = an4475::mac_to_string(&self.an.base_mac);
         self.eth_mac = an4475::mac_to_string(&self.an.eth_mac);
-        self.gpon_sn = self.an.gpon_sn.iter().map(|b| format!("{b:02X}")).collect();
+        // 界面按 fiberhome-factory 的写法显示（`FHTT` + 8 位 hex），不是 16 位裸 hex。
+        self.gpon_sn = an4475::gpon_sn_display(&self.an.gpon_sn);
         self.gpon_pw = self.an.gpon_pw.clone();
         self.wifi_2g4 = an4475::mac_to_string(&self.an.wifi_2g4);
         self.wifi_5g = an4475::mac_to_string(&self.an.wifi_5g);
     }
 
-    fn apply_to_an(&mut self) {
+    /// 把输入框里的身份字段落到 `self.an`。
+    ///
+    /// GPON SN 走 fiberhome-factory 的规则，解析不了就返回 `Err` 由调用方中止保存 ——
+    /// 以前是「长度不对就静默保留原值」，产线上手滑漏一位根本看不出来。
+    fn apply_to_an(&mut self) -> Result<(), String> {
         if let Some(m) = an4475::parse_mac(&self.label_mac) {
             self.an.base_mac = m;
         }
@@ -137,21 +143,11 @@ impl Editor {
         }
         self.an.device_sn = self.device_sn.trim().to_string();
         self.an.gpon_pw = self.gpon_pw.trim().to_string();
-        // GPON SN 允许输入 16 位 hex；不足则保持原值，免得手滑把身份写坏。
-        let hex: String = self
-            .gpon_sn
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        if hex.len() == 16 {
-            let mut sn = [0u8; 8];
-            for i in 0..8 {
-                if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
-                    sn[i] = b;
-                }
-            }
-            self.an.gpon_sn = sn;
+        // 输入框为空视为「不改」，保持载入时的值；非空则必须解析得通。
+        if !self.gpon_sn.trim().is_empty() {
+            self.an.gpon_sn = an4475::parse_gpon_sn(&self.gpon_sn)?;
         }
+        Ok(())
     }
 
     /// 机型切换：三套布局互不通用（magic 不同），切过去只是换面板，
@@ -555,7 +551,10 @@ impl eframe::App for Editor {
                             .add(egui::Button::new(egui::RichText::new("保存 2 MiB").strong()))
                             .clicked()
                         {
-                            self.apply_to_an();
+                            if let Err(e) = self.apply_to_an() {
+                                self.msg = format!("未保存：{e}");
+                                return;
+                            }
                             let opts = an4475::CompactOptions {
                                 pon_aponcal: self.an_pon_aponcal,
                             };
@@ -871,14 +870,63 @@ impl Editor {
                 self.eth_mac = an4475::mac_to_string(&m);
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("GPON SN（16 位 hex）");
-            ui.add(egui::TextEdit::singleline(&mut self.gpon_sn).desired_width(FIELD));
-        });
-        ui.horizontal(|ui| {
-            ui.label("GPON 密码（10 字符）");
-            ui.add(egui::TextEdit::singleline(&mut self.gpon_pw).desired_width(FIELD));
-        });
+        // GPON SN / 密码两行的标签字数差 5 个，用 horizontal 会让输入框左边缘错开
+        // 十来个像素（截图上很显眼）；Grid 自动对齐三列。
+        egui::Grid::new("an_gpon_identity")
+            .num_columns(3)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("GPON SN");
+                ui.add_sized(
+                    [FIELD, ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.gpon_sn)
+                        .font(egui::TextStyle::Monospace),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("随机")
+                        .on_hover_text("FHTT + 4 字节随机，与 fiberhome-factory 的 random_sn 同款")
+                        .clicked()
+                    {
+                        self.an.gpon_sn = an4475::random_gpon_sn();
+                        self.gpon_sn = an4475::gpon_sn_display(&self.an.gpon_sn);
+                    }
+                    // 写进去的到底是什么，直接摊开：厂商码 4 字节 ASCII + 序列号 4 字节二进制。
+                    match an4475::parse_gpon_sn(&self.gpon_sn) {
+                        Ok(sn) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "→ {}（{} + {}）",
+                                    an4475::hex_upper(&sn),
+                                    String::from_utf8_lossy(&sn[..an4475::AN_GPON_VENDOR_LEN]),
+                                    an4475::hex_upper(&sn[an4475::AN_GPON_VENDOR_LEN..])
+                                ))
+                                .monospace()
+                                .color(egui::Color32::from_gray(0x70)),
+                            )
+                            .on_hover_text(
+                                "写进镜像 0x38 的 8 字节：前 4 字节厂商码按 ASCII，\
+                                 后 4 字节序列号按二进制；factory_conf 的 GponSN 存同一份 16 位 hex",
+                            );
+                        }
+                        Err(_) => {
+                            ui.label(
+                                egui::RichText::new("格式不对，保存会被拒绝")
+                                    .color(egui::Color32::from_rgb(0xC0, 0x39, 0x2B)),
+                            );
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("GPON 密码（10 字符）");
+                ui.add_sized(
+                    [FIELD, ui.spacing().interact_size.y],
+                    egui::TextEdit::singleline(&mut self.gpon_pw),
+                );
+                ui.weak("ASCII，写入 factory_conf 时转 hex");
+                ui.end_row();
+            });
 
         ui.add_space(6.0);
         ui.separator();
@@ -1453,12 +1501,14 @@ fn apply_light_theme(ctx: &egui::Context) -> std::sync::Arc<egui::Style> {
     style
 }
 
-/// 无界面批处理：`an758x-factory --export-an <输入> <输出> [--pon-aponcal]`。
+/// 无界面批处理：`an758x-factory --export-an <输入> <输出> [--pon-aponcal] [--gpon-sn <SN>]`。
 ///
 /// 输入可以是 mtd9 备份，也可以是 1/2 MiB 容器；输出一律 2 MiB。
 /// 加 `--pon-aponcal` 时，上行 5 张 BDBOB 校准表会先按 fiberhome-factory 的流程
 /// 转成 APONCAL 再写进各自的固定槽，产出的镜像 PON 区可直接交给 PonWrt。
-fn export_an_cli(input: &str, output: &str, pon_aponcal: bool) {
+/// `--gpon-sn` 按 fiberhome-factory 的规则改写 GPON SN（两种写法都收），
+/// 头部 `0x38` 与 `factory_conf` 的 `GponSN` 会一起更新。
+fn export_an_cli(input: &str, output: &str, pon_aponcal: bool, gpon_sn: Option<&str>) {
     let bytes = match std::fs::read(input) {
         Ok(b) => b,
         Err(e) => {
@@ -1471,10 +1521,27 @@ fn export_an_cli(input: &str, output: &str, pon_aponcal: bool) {
     } else {
         an4475::parse_mtd9(&bytes)
     };
-    let Some(a) = parsed else {
+    let Some(mut a) = parsed else {
         eprintln!("无法识别输入（既不是 mtd9 备份，也不是 AN4-* 容器）: {input}");
         return;
     };
+    if let Some(text) = gpon_sn {
+        match an4475::parse_gpon_sn(text) {
+            Ok(sn) => {
+                println!(
+                    "GPON SN: {} -> {}（hex {}）",
+                    an4475::gpon_sn_display(&a.gpon_sn),
+                    an4475::gpon_sn_display(&sn),
+                    an4475::hex_upper(&sn)
+                );
+                a.gpon_sn = sn;
+            }
+            Err(e) => {
+                eprintln!("GPON SN 无效：{e}");
+                return;
+            }
+        }
+    }
     let opts = an4475::CompactOptions { pon_aponcal };
     match a.encode_compact_with(opts) {
         Ok((img, inlines)) => match std::fs::write(output, &img) {
@@ -1716,8 +1783,15 @@ fn export_mt76_cli(input: &str, output: &str, carve: bool) {    let bytes = matc
 fn main() -> eframe::Result {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() >= 4 && argv[1] == "--export-an" {
-        let pon = argv[4..].iter().any(|a| a == "--pon-aponcal");
-        export_an_cli(&argv[2], &argv[3], pon);
+        let rest = &argv[4..];
+        let pon = rest.iter().any(|a| a == "--pon-aponcal");
+        // `--gpon-sn` 后面紧跟一个值：两种写法都收，解析失败直接退出，不写半成品。
+        let gpon = rest
+            .iter()
+            .position(|a| a == "--gpon-sn")
+            .and_then(|i| rest.get(i + 1))
+            .map(String::as_str);
+        export_an_cli(&argv[2], &argv[3], pon, gpon);
         return Ok(());
     }
     if argv.len() >= 4 && argv[1] == "--export-mt76" {
@@ -1736,7 +1810,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "AN758X Factory 编辑器 v0.8.6",
+        "AN758X Factory 编辑器 v0.8.8",
         options,
         Box::new(|cc| {
             font::install(&cc.egui_ctx);

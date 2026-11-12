@@ -215,6 +215,9 @@ an758x-factory --export-mt76 factory-an4475-2mib.bin mt7990_eeprom.bin
 an758x-factory --export-an mtd9_factory.bin factory-an4475-aponcal.bin --pon-aponcal
 python3 an758x_factory_demo.py an4475 --bin mtd9_factory.bin \
     -o factory-an4475-aponcal.bin --pon-aponcal
+
+# GPON SN 两种写法都收（`FHTT` + 8 位 hex 或 16 位 hex），规则同 fiberhome-factory
+an758x-factory --export-an mtd9_factory.bin out.bin --gpon-sn FHTTC26A69FF
 ```
 
 示例产物见 [`examples/factory-h3c-demo.bin`](examples/factory-h3c-demo.bin)、
@@ -463,6 +466,72 @@ an758x-factory --export-an mtd9_factory.bin out.bin --pon-aponcal
 - **GPON SN = ASCII `FHTT` + 4 字节**：真机 `46485454C26A69FF` → `FHTT` + `C2 6A 69 FF`。这 4 字节与 MAC/SN 无对应关系，只能单独填。
 - **GPON 密码是 hex 编码的 ASCII**：`48473236303132333435` → `HG26012345`。
 
+#### GPON SN 的两种写法（与 fiberhome-factory 一致）
+
+同一个 8 字节有两种说法，工具两种都收、也都能显示：
+
+| 写法 | 例子 | 用在哪 |
+|---|---|---|
+| 厂商码 + 8 位 hex | `FHTTC26A69FF` | 贴纸、工单、`random_sn()` |
+| 16 位 hex | `46485454C26A69FF` | UCI `GponSN`、头部 `0x38` 原样 |
+
+解析顺序照搬上游 `display_sn()`：**先**看是不是 12 个字符且前 4 个是 ASCII 字母数字，是就按「4 字节 ASCII + 4 字节 hex」拆；**否则**整串（容忍 `:` `-`）当 16 位 hex 解 8 字节，并拒绝全 `00` / 全 `FF`。
+
+读回时反过来：前 4 字节都是字母数字就拼成 `FHTT` + 8 位 hex，否则给 16 位 hex（厂商码不是 ASCII 的老设备）。
+
+界面上输入框右侧实时显示「写进去的 8 字节」，格式不对直接红字，**保存会被拒绝**（旧版是静默保留原值，漏一位都看不出来）。`随机` 按钮同上游 `random_sn()`：`FHTT` + 4 字节随机。
+
+命令行的 `--gpon-sn` 走同一套解析，两种写法产出的镜像逐字节相同：
+
+```bash
+an758x-factory --export-an mtd9_factory.bin out.bin --gpon-sn FHTTC26A69FF
+an758x-factory --export-an mtd9_factory.bin out.bin --gpon-sn 46485454C26A69FF  # 等价
+```
+
+#### 给 PonWrt 的 12 字符视图（头部 `0xA2`）
+
+PonWrt 的 board 表只提供三种 identity 编码：`pon-ascii12`（12 字符 ASCII）、`mac-colon17`、`mac-binary6`。`0x38` 那种「4 字节 ASCII 厂商码 + 4 字节二进制序列号」**没有一种装得下**，而 C 侧不改。
+
+解法是把同一份 SN 在容器头部空闲区再存一份 12 字符文本：
+
+| 位置 | 长度 | 内容 | 谁来读写 |
+|---|---|---|---|
+| `0x38` | 8 | 二进制：`FHTT` + `C2 6A 69 FF` | 厂商固件 / 本工具 |
+| `0xA2` | 12 | ASCII：`FHTTC26A69FF` | **PonWrt**（`pon-ascii12`） |
+
+`0xA2`–`0xFFF` 在真机上全是 `0xFF`，不与任何既有字段重叠（头部字段到 `0xA2` 就结束了）。
+
+同步规则只有一条：**视图有效就以视图为准**。
+
+- 打包时：`0x38` 写 8 字节二进制，`0xA2` 写 12 字符文本，`factory_conf` 的 `GponSN` 写 16 位 hex —— 三处同源；
+- 打开时：若 `0xA2` 是 12 个可打印 ASCII 且能解析，**压过 `0x38`**（说明 PonWrt 改过了）；否则（老镜像的 `0xFF`、或厂商码非 ASCII 写不下）退回 `0x38`；
+- 于是「PonWrt 改 `0xA2` → 用本工具打开并保存」就把 `0x38` 与 `factory_conf` 一起带过来了。
+
+PonWrt 侧只需在 `case "$board"` 里补一段，不动 C：
+
+```sh
+	# 0xA2: 12-char ASCII view of the 8-byte binary GPON SN at 0x38 (0xA2 = 162).
+	# an758x-factory keeps 0x38 / 0xA2 / factory_conf GponSN in sync on (re)pack.
+	fiberhome,an4475-g2)
+		identity_available=1
+		json_add_object identity
+		json_add_object targets
+		json_add_object factory
+		json_add_object fields
+		identity_field pon_sn pon-sn 162 12 pon-ascii12
+		identity_field pon_mac mac 64 6 mac-binary6
+		identity_field lan_base_mac mac 70 6 mac-binary6
+		json_close_object
+		json_close_object
+		json_close_object
+		json_close_object
+		;;
+```
+
+副作用要知道：**导出的镜像比输入多 12 字节差异**（就在 `0xA2`），其余字节不变。老镜像 `0xA2` 是 `0xFF`，写进去就是这 12 个字节；不想要这份视图时把 `AN_H_GPON_SN_VIEW` 那段写入去掉即可。
+
+`pon_mac` / `lan_base_mac` 用 `mac-binary6` 指向 `0x40` / `0x46` 是原生 6 字节，PonWrt 可以直接读写；但 `factory_conf` 里那 12 套 MAC 是派生值，改动后仍需本工具重新派生一次才一致。
+
 工具在派生表下方做唯一性自检：12 个地址（基准 + 4 个网络侧 + 5 个 LAN + 2 个 Wi-Fi）出现重复就红字点名，例如「MAC 冲突：D4:A0:29:04:E7:71 同时用于 eth1mac / Wi-Fi 2.4G」。原厂这套分配本身不冲突（`D4:9F` 段占 50–53/58，`D4:A0` 段占 50/58 与 71–75，两个前缀互不相干），冲突只可能来自手改；另一种「冲突」是整片镜像刷到第二台机 —— 那时 12 个地址全都重复，只能靠每台重新生成，工具没法代劳。
 
 ### 2 MiB 容器（`AN4-2MiB`）
@@ -487,6 +556,8 @@ an758x-factory --export-an mtd9_factory.bin out.bin --pon-aponcal
 | `0x000060` | 54 | 派生 MAC 9 项（internet/tr069/voip/priprotocol + eth1..5） |
 | `0x000096` | 6 | Wi-Fi 2.4G MAC（与 EEPROM `+0x04`、`APMAC_1` 同步） |
 | `0x00009C` | 6 | Wi-Fi 5G MAC（与 EEPROM `+0x0A`、`APMAC_2` 同步） |
+| `0x0000A2` | 12 | **GPON SN 的 12 字符视图**（`FHTTC26A69FF`），给 PonWrt 的 `pon-ascii12` 用；老镜像此区为 `0xFF` |
+| `0x0000AE`–`0x000FFF` | 3402 | 空闲，全 `0xFF` |
 | `0x001000` | 48/项 | TOC：名 32 + `off`/`raw_len`/`stored_len` 各 4 + 压缩标志 1 |
 | `0x002000` | — | 其余 9 个配置文件（能压就压，压不动原样存），实测占到 `0x003CAB` |
 | `0x040000` | 1 353 728 | **`MT7993_EEPROM.bin` 原样存放、不压缩**（Wi-Fi 校准区只读这个偏移即可） |

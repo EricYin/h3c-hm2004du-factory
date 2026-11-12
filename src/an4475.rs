@@ -132,6 +132,18 @@ pub const AN_H_MACS: usize = 0x60;
 pub const AN_H_WIFI_2G4: usize = 0x96;
 pub const AN_H_WIFI_5G: usize = 0x9c;
 
+/// 头部 `0xA2` 起 12 字节：GPON SN 的 **12 字符 ASCII 视图**（`FHTTC26A69FF`）。
+///
+/// 为什么要多存一份：PonWrt 的 identity 机制只有 `pon-ascii12` / `mac-colon17` /
+/// `mac-binary6` 三种编码，`0x38` 那种「4 字节 ASCII 厂商码 + 4 字节二进制序列号」
+/// 它表达不了，而 C 侧不改。于是把同一份 SN 在这块空闲区按 `pon-ascii12` 能认的
+/// 形状再存一遍：PonWrt 只读写这 12 字节，`0x38` 与 `factory_conf` 的 `GponSN`
+/// 由本工具在打包/打开时双向同步。
+///
+/// 实测 `0xA2`–`0xFFF` 在真机上全为 `0xFF`，不与任何既有字段重叠。
+pub const AN_H_GPON_SN_VIEW: usize = 0xa2;
+pub const AN_GPON_SN_VIEW_SIZE: usize = 12;
+
 /// 主配置文件名。身份字段全在这一个文件的 UCI 文本里。
 pub const AN_MAIN_CONF: &str = "factory_conf";
 /// Wi-Fi 校准文件名（1.32 MiB，容器里必须压缩存放）。
@@ -1247,7 +1259,15 @@ impl An4475 {
         let mut s = String::new();
         s.push_str("机型       : AN4475 (10G PON)\n");
         s.push_str(&format!("设备序列号 : {}\n", self.device_sn));
-        s.push_str(&format!("GPON SN    : {}\n", hex_upper(&self.gpon_sn)));
+        s.push_str(&format!(
+            "GPON SN    : {}{}\n",
+            gpon_sn_display(&self.gpon_sn),
+            if gpon_sn_is_blank(&self.gpon_sn) {
+                "（未写入）"
+            } else {
+                ""
+            }
+        ));
         s.push_str(&format!("GPON 密码  : {}\n", self.gpon_pw));
         s.push_str(&format!("基准 MAC   : {}\n", mac_to_string(&self.base_mac)));
         s.push_str(&format!("LAN 基址   : {}\n", mac_to_string(&self.eth_mac)));
@@ -1343,6 +1363,13 @@ impl An4475 {
         let n = sn.len().min(AN_SN_SIZE);
         img[AN_H_SN..AN_H_SN + n].copy_from_slice(&sn[..n]);
         img[AN_H_GPON_SN..AN_H_GPON_SN + AN_GPON_SN_SIZE].copy_from_slice(&self.gpon_sn);
+        // 12 字符视图：写不下（厂商码非 ASCII、只能给 16 位 hex）就保持 0xFF，
+        // 这时 PonWrt 侧读到的是空值，不会把错的东西写回来。
+        let view = gpon_sn_display(&self.gpon_sn);
+        if view.len() == AN_GPON_SN_VIEW_SIZE && view.is_ascii() {
+            img[AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE]
+                .copy_from_slice(view.as_bytes());
+        }
         img[AN_H_BASE_MAC..AN_H_BASE_MAC + 6].copy_from_slice(&self.base_mac);
         img[AN_H_ETH_MAC..AN_H_ETH_MAC + 6].copy_from_slice(&self.eth_mac);
         img[AN_H_OUI..AN_H_OUI + 3].copy_from_slice(&self.base_mac[..3]);
@@ -1511,6 +1538,11 @@ pub fn parse_compact(data: &[u8]) -> Option<An4475> {
 
     let mut gpon_sn = [0xffu8; 8];
     gpon_sn.copy_from_slice(&data[AN_H_GPON_SN..AN_H_GPON_SN + AN_GPON_SN_SIZE]);
+    // 12 字符视图是 PonWrt 侧唯一的写入口：它被改过就以它为准，重新编码回 8 字节。
+    // 全 0xFF 的老镜像经 lossy 转换会变成 12 个 U+FFFD，`is_ascii()` 直接挡掉。
+    if let Some(sn) = gpon_sn_view(&data) {
+        gpon_sn = sn;
+    }
     let mut base_mac = [0u8; 6];
     base_mac.copy_from_slice(&data[AN_H_BASE_MAC..AN_H_BASE_MAC + 6]);
     let mut eth_mac = [0u8; 6];
@@ -1562,11 +1594,16 @@ pub fn parse_mtd9(data: &[u8]) -> Option<An4475> {
     let gpon_hex = uci_get(&conf, "GponSN").unwrap_or_default();
     let pw_hex = uci_get(&conf, "GPONPassWord").unwrap_or_default();
 
-    let mut gpon_sn = [0xffu8; 8];
-    if let Some(v) = parse_hex(&gpon_hex) {
-        let n = v.len().min(8);
-        gpon_sn[..n].copy_from_slice(&v[..n]);
-    }
+    // 原厂存 16 位 hex，但手工改过/老版本的 conf 里可能直接是 `FHTT...` 文本，
+    // 所以先走 parse_gpon_sn；解不了再退回「能解多少写多少」，最后才留 FF。
+    let gpon_sn = parse_gpon_sn(&gpon_hex).unwrap_or_else(|_| {
+        let mut sn = [0xffu8; 8];
+        if let Some(v) = parse_hex(&gpon_hex) {
+            let n = v.len().min(8);
+            sn[..n].copy_from_slice(&v[..n]);
+        }
+        sn
+    });
     let gpon_pw = parse_hex(&pw_hex)
         .map(|v| String::from_utf8_lossy(&v).trim().to_string())
         .unwrap_or_default();
@@ -1914,8 +1951,114 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(m)
 }
 
-fn hex_upper(data: &[u8]) -> String {
+pub fn hex_upper(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// GPON SN：规则与 fiberhome-factory 的 `display_sn` / `parse_pon_serial` 一致
+// ---------------------------------------------------------------------------
+//
+// 8 字节的 GPON SN 有两种写法，厂商固化的是「4 字节 ASCII 厂商码 + 4 字节二进制序列号」：
+//
+//   FHTTC26A69FF   ← 12 字符，人看着能读（fiberhome-factory 界面上就是这个）
+//   46485454C26A69FF ← 16 位 hex，8 字节原样（UCI `GponSN` 存这个）
+//
+// 两者是同一份数据，只是展示层不同。fiberhome-factory 的 `display_sn` 先按 12 字符解释，
+// 不成立才退到 16 位 hex；本函数照搬这个分支顺序，不自行发明规则。
+
+/// 厂商码长度，也是 8 字节里 ASCII 部分的长度。
+pub const AN_GPON_VENDOR_LEN: usize = 4;
+
+/// 解析 GPON SN 文本，返回写进镜像的 8 字节。
+///
+/// 分支顺序与 fiberhome-factory 的 `display_sn()` 相同：
+///
+/// 1. **12 个字符、前 4 个是 ASCII 字母数字** → 前 4 字节按 ASCII 原样，
+///    后 4 字节按 hex 解码。这是产线上贴纸/工单的写法（`FHTTC26A69FF`）。
+/// 2. **其它** → 整串（允许 `:` `-` 分隔）当 16 位 hex 解成 8 字节，
+///    并拒绝全 `00` / 全 `FF`（`parse_pon_serial()` 的判定，空 SN 是无意义的）。
+///
+/// 12 字符分支上游不做全 0/FF 校验，这里也不做，保持行为一致 —— 否则
+/// `FHTT00000000` 会被拒，而上游能存。
+pub fn parse_gpon_sn(text: &str) -> Result<[u8; 8], String> {
+    let t = text.trim();
+    if t.len() == 12 && t.is_ascii() && t.as_bytes()[..4].iter().all(u8::is_ascii_alphanumeric) {
+        let mut sn = [0u8; 8];
+        sn[..AN_GPON_VENDOR_LEN].copy_from_slice(&t.as_bytes()[..AN_GPON_VENDOR_LEN]);
+        for i in 0..4 {
+            let pair = &t[4 + i * 2..6 + i * 2];
+            sn[4 + i] = u8::from_str_radix(pair, 16)
+                .map_err(|_| format!("GPON SN 序列号部分不是 hex：{pair}"))?;
+        }
+        return Ok(sn);
+    }
+
+    // 上游 decode_hex() 会剔除 `:` 与 `-`，这里跟着剔，其它字符不放过。
+    let compact: String = t.chars().filter(|c| *c != ':' && *c != '-').collect();
+    if !compact.is_ascii() || compact.len() != 16 {
+        return Err(format!(
+            "GPON SN 要 12 位「厂商码+8 位 hex」（如 FHTTC26A69FF）或 16 位 hex，当前 {} 位",
+            compact.chars().count()
+        ));
+    }
+    let mut sn = [0u8; 8];
+    for i in 0..8 {
+        sn[i] = u8::from_str_radix(&compact[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("GPON SN 含非 hex 字符：{compact}"))?;
+    }
+    if sn.iter().all(|b| *b == 0x00) || sn.iter().all(|b| *b == 0xff) {
+        return Err("GPON SN 不能是 8 字节全 00 或全 FF".to_string());
+    }
+    Ok(sn)
+}
+
+/// 8 字节 → 界面显示文本。
+///
+/// 与 fiberhome-factory 读回时的判断一致：前 4 字节都是字母数字就拼成
+/// `FHTT` + 8 位 hex，否则老老实实给 16 位 hex（厂商码不是 ASCII 的老设备）。
+pub fn gpon_sn_display(sn: &[u8; 8]) -> String {
+    if sn[..AN_GPON_VENDOR_LEN]
+        .iter()
+        .all(u8::is_ascii_alphanumeric)
+    {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&sn[..AN_GPON_VENDOR_LEN]),
+            hex_upper(&sn[AN_GPON_VENDOR_LEN..])
+        )
+    } else {
+        hex_upper(sn)
+    }
+}
+
+/// 全 `00` / 全 `FF` 说明 SN 还没写（新镜像默认就是 8 个 `FF`）。
+pub fn gpon_sn_is_blank(sn: &[u8; 8]) -> bool {
+    sn.iter().all(|b| *b == 0x00) || sn.iter().all(|b| *b == 0xff)
+}
+
+/// 从头部 `0xA2` 的 12 字符视图读 SN。
+///
+/// 老镜像这块是 `0xFF`，`from_utf8_lossy` 会给出 12 个 U+FFFD，`is_ascii()` 挡掉；
+/// 写坏成半截 ASCII 的也不采信。只有「12 个可打印 ASCII 且能按规则解析」才算数。
+pub fn gpon_sn_view(data: &[u8]) -> Option<[u8; 8]> {
+    let raw = data.get(AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE)?;
+    let text = String::from_utf8_lossy(raw);
+    let text = text.trim();
+    if !text.is_ascii() || text.len() != AN_GPON_SN_VIEW_SIZE {
+        return None;
+    }
+    parse_gpon_sn(text).ok()
+}
+
+/// 随机 SN，与 fiberhome-factory 的 `random_sn()` 同款：`FHTT` + 4 字节随机 hex。
+pub fn random_gpon_sn() -> [u8; 8] {
+    let mut sn = [0xffu8; 8];
+    sn[..AN_GPON_VENDOR_LEN].copy_from_slice(b"FHTT");
+    let mut b = [0u8; 4];
+    let _ = getrandom::fill(&mut b);
+    sn[AN_GPON_VENDOR_LEN..].copy_from_slice(&b);
+    sn
 }
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
@@ -2363,6 +2506,136 @@ mod tests {
             &img[AN_CAL_FIXED_OFF..AN_CAL_FIXED_OFF + 2048],
             &bad[..],
             "坏表必须原样留在槽里"
+        );
+    }
+
+    /// webif 那行 `GponSN` 就是 16 位 hex；贴纸/工单是 `FHTT` + 8 位 hex。
+    /// 两种写法必须落到同一份 8 字节。
+    #[test]
+    fn gpon_sn_both_spellings_agree() {
+        let hex = parse_gpon_sn("46485454C26A69FF").expect("16 位 hex");
+        let readable = parse_gpon_sn("FHTTC26A69FF").expect("12 字符厂商码形式");
+        assert_eq!(hex, readable);
+        assert_eq!(hex[..4], *b"FHTT");
+        assert_eq!(&hex[4..], &[0xC2, 0x6A, 0x69, 0xFF]);
+        // 读回按 fiberhome-factory 的 display_sn 反向拼，应还原成可读形式
+        assert_eq!(gpon_sn_display(&hex), "FHTTC26A69FF");
+    }
+
+    /// 厂商码不是 ASCII 的老设备只能走 16 位 hex，读回也应是 16 位 hex。
+    #[test]
+    fn gpon_sn_non_ascii_vendor_stays_hex() {
+        let sn = parse_gpon_sn("0102030405060708").expect("非 ASCII 厂商码");
+        assert_eq!(gpon_sn_display(&sn), "0102030405060708");
+    }
+
+    /// 全 00 / 全 FF 在 16 位 hex 分支要拒（上游 parse_pon_serial 的判定）。
+    #[test]
+    fn gpon_sn_rejects_blank() {
+        assert!(parse_gpon_sn("0000000000000000").is_err());
+        assert!(parse_gpon_sn("FFFFFFFFFFFFFFFF").is_err());
+        assert!(gpon_sn_is_blank(&[0xff; 8]));
+        // 12 字符分支上游不校验，保持同一行为
+        assert!(parse_gpon_sn("FHTT00000000").is_ok());
+    }
+
+    /// 长度/字符不对要报错，不能静默 —— 产线上少一位最难查。
+    #[test]
+    fn gpon_sn_rejects_bad_input() {
+        assert!(parse_gpon_sn("FHTTC26A69F").is_err());
+        assert!(parse_gpon_sn("FHTTC26A69FFF").is_err());
+        assert!(parse_gpon_sn("").is_err());
+        assert!(parse_gpon_sn("FHTTG26A69FF").is_err(), "序列号部分不是 hex");
+        // 上游 decode_hex 容许 `:` `-`，这里跟着容许
+        let sn = parse_gpon_sn("4648:5454-C26A:69FF").expect("带分隔符");
+        assert_eq!(gpon_sn_display(&sn), "FHTTC26A69FF");
+    }
+
+    /// 随机 SN 的形状要能直接过解析：`FHTT` + 8 位 hex。
+    #[test]
+    fn random_gpon_sn_round_trips() {
+        let sn = random_gpon_sn();
+        assert_eq!(&sn[..4], b"FHTT");
+        let text = gpon_sn_display(&sn);
+        assert_eq!(text.len(), 12, "{text}");
+        assert_eq!(parse_gpon_sn(&text).expect("自己生成的必须能解"), sn);
+    }
+
+    /// 打包时在 0xA2 写 12 字符视图，`0x38` 仍是 8 字节二进制 —— 两份数据同一含义。
+    #[test]
+    fn gpon_sn_view_written() {
+        let mut a = An4475::new();
+        a.gpon_sn = parse_gpon_sn("FHTTC26A69FF").expect("解析");
+        let (img, _) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: false })
+            .expect("打包");
+        assert_eq!(
+            &img[AN_H_GPON_SN..AN_H_GPON_SN + AN_GPON_SN_SIZE],
+            &[0x46, 0x48, 0x54, 0x54, 0xc2, 0x6a, 0x69, 0xff]
+        );
+        assert_eq!(
+            &img[AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE],
+            b"FHTTC26A69FF"
+        );
+        let b = parse_compact(&img).expect("读回");
+        assert_eq!(b.gpon_sn, a.gpon_sn);
+    }
+
+    /// PonWrt 只会改 0xA2 这 12 个字符，读回时必须让它压过 `0x38`。
+    #[test]
+    fn gpon_sn_view_wins_over_binary() {
+        let mut a = An4475::new();
+        a.gpon_sn = parse_gpon_sn("FHTTC26A69FF").expect("解析");
+        let (mut img, _) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: false })
+            .expect("打包");
+        img[AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE]
+            .copy_from_slice(b"FHTT99999999");
+        // 模拟「0x38 还是旧值、只有视图被改」
+        img[AN_H_GPON_SN..AN_H_GPON_SN + AN_GPON_SN_SIZE]
+            .copy_from_slice(&[0x46, 0x48, 0x54, 0x54, 0xc2, 0x6a, 0x69, 0xff]);
+        let b = parse_compact(&img).expect("读回");
+        assert_eq!(b.gpon_sn, parse_gpon_sn("FHTT99999999").expect("解析"));
+        let (img2, _) = b
+            .encode_compact_with(CompactOptions { pon_aponcal: false })
+            .expect("再打包");
+        assert_eq!(
+            &img2[AN_H_GPON_SN..AN_H_GPON_SN + AN_GPON_SN_SIZE],
+            b"FHTT\x99\x99\x99\x99",
+            "再打包时 0x38 必须跟随视图"
+        );
+    }
+
+    /// 老镜像视图区是 0xFF：不许被 lossy 出来的 12 个 U+FFFD 污染，仍按 0x38 读。
+    #[test]
+    fn gpon_sn_view_ignores_blank() {
+        let mut a = An4475::new();
+        a.gpon_sn = parse_gpon_sn("FHTTC26A69FF").expect("解析");
+        let (mut img, _) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: false })
+            .expect("打包");
+        img[AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE].fill(0xff);
+        assert!(gpon_sn_view(&img).is_none());
+        let b = parse_compact(&img).expect("读回");
+        assert_eq!(
+            b.gpon_sn,
+            parse_gpon_sn("FHTTC26A69FF").expect("解析"),
+            "视图为空时应退回 0x38"
+        );
+    }
+
+    /// 厂商码非 ASCII 时只能给 16 位 hex，视图放不下就留 0xFF，不能截断成假值。
+    #[test]
+    fn gpon_sn_view_left_blank_for_hex_only() {
+        let mut a = An4475::new();
+        a.gpon_sn = parse_gpon_sn("0102030405060708").expect("解析");
+        let (img, _) = a
+            .encode_compact_with(CompactOptions { pon_aponcal: false })
+            .expect("打包");
+        assert!(gpon_sn_view(&img).is_none());
+        assert_eq!(
+            &img[AN_H_GPON_SN_VIEW..AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE],
+            &[0xff; AN_GPON_SN_VIEW_SIZE]
         );
     }
 }

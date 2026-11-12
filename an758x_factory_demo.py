@@ -986,6 +986,7 @@ AN_SN_SIZE = 17
 AN_SN_CAP = 24
 AN_GPON_SN_SIZE = 8
 AN_GPON_PW_SIZE = 10
+AN_GPON_VENDOR_LEN = 4
 
 AN_H_SN = 0x20
 AN_H_GPON_SN = 0x38
@@ -998,6 +999,13 @@ AN_H_MACS = 0x60
 # 0x60 + 9×6 = 0x96，Wi-Fi 两位 MAC 紧接其后，到 0x1000 前还有很大余量。
 AN_H_WIFI_2G4 = 0x96
 AN_H_WIFI_5G = 0x9C
+
+# 头部 0xA2 起 12 字节：GPON SN 的 12 字符 ASCII 视图（FHTTC26A69FF）。
+# PonWrt 的 identity 只有 pon-ascii12 / mac-colon17 / mac-binary6 三种编码，
+# 表达不了 0x38 那种「4 ASCII + 4 二进制」，又不改 C 侧；于是同值再存一份文本，
+# PonWrt 只动这 12 字节，0x38 与 factory_conf 由本工具同步。
+AN_H_GPON_SN_VIEW = 0xA2
+AN_GPON_SN_VIEW_SIZE = 12
 
 # 城市宽带（CT）ONU 的 MAC 分配：基准 MAC 往上 +1/+2/+3/+8 依次是上网、
 # TR-069、VoIP、私有协议；LAN 口另取一个基址（真机上与基准 MAC 差
@@ -1370,14 +1378,91 @@ def looks_like_an4475_volume(data):
     return b"fhdata" in data[:AN_UBI_PEB]
 
 
+def an4475_parse_gpon_sn(text):
+    """GPON SN 文本 -> 8 字节，规则与 fiberhome-factory 的 display_sn() 一致。
+
+    8 字节 = 4 字节 ASCII 厂商码 + 4 字节二进制序列号，两种写法：
+      `FHTTC26A69FF`    12 字符，产线工单/贴纸的读法；
+      `46485454C26A69FF` 16 位 hex，UCI `GponSN` 的存法。
+    先按 12 字符解释（前 4 必须是 ASCII 字母数字），不成立才退到 16 位 hex ——
+    与上游分支顺序相同，不自己发明规则。
+    """
+    t = text.strip()
+    if len(t) == 12 and t.isascii() and all(c.isalnum() for c in t[:4]):
+        tail = t[4:]
+        try:
+            body = bytes.fromhex(tail)
+        except ValueError:
+            raise ValueError("GPON SN 序列号部分不是 hex：%s" % tail)
+        if len(body) != 4:
+            raise ValueError("GPON SN 序列号要 8 位 hex：%s" % tail)
+        return t[:AN_GPON_VENDOR_LEN].encode("ascii") + body
+    # 上游 decode_hex() 会剔掉 `:` 与 `-`，这里跟着剔。
+    compact = t.replace(":", "").replace("-", "")
+    if not compact.isascii() or len(compact) != 16:
+        raise ValueError(
+            "GPON SN 要 12 位「厂商码+8 位 hex」（如 FHTTC26A69FF）或 16 位 hex，"
+            "当前 %d 位" % len(compact))
+    try:
+        sn = bytes.fromhex(compact)
+    except ValueError:
+        raise ValueError("GPON SN 含非 hex 字符：%s" % compact)
+    if an4475_gpon_sn_is_blank(sn):
+        raise ValueError("GPON SN 不能是 8 字节全 00 或全 FF")
+    return sn
+
+
+def an4475_gpon_sn_display(sn):
+    """8 字节 -> 界面文本，判定同 fiberhome-factory 读回：前 4 字节是 ASCII
+    字母数字就拼成 `FHTT` + 8 位 hex，否则给 16 位 hex。"""
+    sn = bytes(sn[:AN_GPON_SN_SIZE])
+    if len(sn) < AN_GPON_SN_SIZE:
+        sn = sn + b"\xff" * (AN_GPON_SN_SIZE - len(sn))
+    head = sn[:AN_GPON_VENDOR_LEN]
+    if all(0x30 <= b <= 0x39 or 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A for b in head):
+        return head.decode("ascii") + sn[AN_GPON_VENDOR_LEN:].hex().upper()
+    return sn.hex().upper()
+
+
+def an4475_gpon_sn_is_blank(sn):
+    """全 00 / 全 FF 表示 SN 还没写（新建镜像默认 8 个 FF）。"""
+    sn = bytes(sn)
+    return sn == b"\x00" * len(sn) or sn == b"\xff" * len(sn)
+
+
+def an4475_gpon_sn_view(data):
+    """从头部 0xA2 的 12 字符视图读 SN。
+
+    老镜像这块是 0xFF，不是 12 个可打印 ASCII，直接返回 None；写坏成半截的也不采信。
+    PonWrt 只改这块，所以它有效时应当压过 0x38 的二进制值。
+    """
+    raw = bytes(data[AN_H_GPON_SN_VIEW:AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE])
+    if len(raw) != AN_GPON_SN_VIEW_SIZE:
+        return None
+    if not all(0x20 <= b < 0x7F for b in raw):
+        return None
+    try:
+        return an4475_parse_gpon_sn(raw.decode("ascii"))
+    except ValueError:
+        return None
+
+
+def an4475_random_gpon_sn():
+    """同 fiberhome-factory 的 random_sn()：`FHTT` + 4 字节随机 hex。"""
+    import os
+    return b"FHTT" + os.urandom(4)
+
+
 def parse_an4475_mtd9(data):
     """解析 mtd9 备份，返回身份字段与全部出厂文件。"""
     files = an4475_read_files(data)
     text = files.get(AN_MAIN_CONF, b"").decode("utf-8", "ignore")
     gpon_raw = _uci_get(text, "GponSN")
     pw_raw = _uci_get(text, "GPONPassWord")
+    # 原厂存 16 位 hex，但老版本/手工改过的可能直接存 `FHTT...` 文本，
+    # 所以统一走 parse 而不是 bytes.fromhex；解析不了才当「没写 SN」。
     try:
-        gpon_sn = bytes.fromhex(gpon_raw)[:AN_GPON_SN_SIZE]
+        gpon_sn = an4475_parse_gpon_sn(gpon_raw) if gpon_raw else b"\xff" * AN_GPON_SN_SIZE
     except ValueError:
         gpon_sn = b"\xff" * AN_GPON_SN_SIZE
     try:
@@ -1447,6 +1532,10 @@ def encode_an4475_2mib(sn, gpon_sn, gpon_pw, base_mac, eth_mac, files,
     snb = sn.encode("ascii", "ignore")[:AN_SN_SIZE]
     img[AN_H_SN:AN_H_SN + len(snb)] = snb
     img[AN_H_GPON_SN:AN_H_GPON_SN + AN_GPON_SN_SIZE] = gpon_sn[:AN_GPON_SN_SIZE]
+    # 12 字符视图：写不下（厂商码非 ASCII，只能给 16 位 hex）就留 0xFF。
+    view = an4475_gpon_sn_display(gpon_sn).encode("ascii", "ignore")
+    if len(view) == AN_GPON_SN_VIEW_SIZE:
+        img[AN_H_GPON_SN_VIEW:AN_H_GPON_SN_VIEW + AN_GPON_SN_VIEW_SIZE] = view
     img[AN_H_BASE_MAC:AN_H_BASE_MAC + 6] = base_mac
     img[AN_H_ETH_MAC:AN_H_ETH_MAC + 6] = eth_mac
     img[AN_H_OUI:AN_H_OUI + 3] = base_mac[:3]
@@ -1546,6 +1635,10 @@ def parse_an4475_compact(data):
                 blob = b""
         files[name] = blob[:raw_len]
     sn = data[AN_H_SN:AN_H_SN + AN_SN_CAP].split(b"\x00")[0].decode("ascii", "ignore")
+    # 12 字符视图是 PonWrt 侧唯一写入口，被改过就以它为准。
+    gpon_sn = an4475_gpon_sn_view(data)
+    if gpon_sn is None:
+        gpon_sn = bytes(data[AN_H_GPON_SN:AN_H_GPON_SN + AN_GPON_SN_SIZE])
     base_mac = bytes(data[AN_H_BASE_MAC:AN_H_BASE_MAC + 6])
     # 头部有就信头部；旧镜像那两位是 0xFF，退回 EEPROM 里读。
     wifi_2g4 = bytes(data[AN_H_WIFI_2G4:AN_H_WIFI_2G4 + 6])
@@ -1556,7 +1649,7 @@ def parse_an4475_compact(data):
             wifi_2g4, wifi_5g = eep
     return {
         "sn": sn.strip(),
-        "gpon_sn": bytes(data[AN_H_GPON_SN:AN_H_GPON_SN + AN_GPON_SN_SIZE]),
+        "gpon_sn": gpon_sn,
         "gpon_pw": data[AN_H_GPON_PW:AN_H_GPON_PW + AN_GPON_PW_SIZE]
         .split(b"\x00")[0].decode("ascii", "ignore").strip(),
         "base_mac": base_mac,
@@ -1608,7 +1701,9 @@ def main():
     a = sub.add_parser("an4475", help="AN4475: 解析 mtd9 备份 / 生成 2 MiB 容器")
     a.add_argument("--bin", help="mtd9 备份 (.bin) 或已生成的 AN4-2MiB / AN4-1MiB 镜像")
     a.add_argument("--sn", help="设备序列号（17 字符）")
-    a.add_argument("--gpon-sn", help="GPON SN，16 位 hex（含 FHTT 厂商码）")
+    a.add_argument("--gpon-sn",
+                   help="GPON SN：FHTT+8 位 hex（如 FHTTC26A69FF）或 16 位 hex"
+                        "（如 46485454C26A69FF），规则同 fiberhome-factory")
     a.add_argument("--gpon-pw", help="GPON 密码（10 字符 ASCII）")
     a.add_argument("--mac", help="基准 MAC（base_mac / brmac / ponmac）")
     a.add_argument("--eth-mac", help="LAN 基址 MAC（eth1mac）")
@@ -1827,7 +1922,10 @@ def main():
         if args.sn:
             sn = args.sn
         if args.gpon_sn:
-            gpon_sn = bytes.fromhex(args.gpon_sn)
+            try:
+                gpon_sn = an4475_parse_gpon_sn(args.gpon_sn)
+            except ValueError as e:
+                sys.exit(str(e))
         if args.gpon_pw:
             gpon_pw = args.gpon_pw
         if args.mac:
@@ -1850,7 +1948,8 @@ def main():
                 wifi5g = m
         if base and eth:
             print("  Serial    : %s" % sn)
-            print("  GPON SN   : %s" % gpon_sn.hex().upper())
+            print("  GPON SN   : %s  (%s)" % (an4475_gpon_sn_display(gpon_sn),
+                                              gpon_sn.hex().upper()))
             print("  GPON 密码 : %s" % gpon_pw)
             print("  基准 MAC  : %s" % mac_to_string(base))
             print("  LAN 基址  : %s" % mac_to_string(eth))
